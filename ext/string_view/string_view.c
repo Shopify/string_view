@@ -21,6 +21,7 @@ typedef struct {
     rb_encoding *enc;   /* cached encoding — avoids rb_enc_get per call */
     long   offset;      /* byte offset into backing */
     long   length;      /* byte length of this view */
+    int    single_byte; /* cached: 1 if char==byte (ASCII/single-byte enc), 0 if multibyte, -1 unknown */
 } string_view_t;
 
 static VALUE cStringView;
@@ -63,6 +64,9 @@ static const rb_data_type_t string_view_type = {
     RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE
 };
 
+/* Forward declarations */
+static int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
+
 /* ========================================================================= */
 /* Internal helpers                                                          */
 /* ========================================================================= */
@@ -97,10 +101,11 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
                                      &string_view_type, sv);
     RB_OBJ_WRITE(obj, &sv->backing, parent->backing);
-    sv->base    = parent->base;
-    sv->enc     = parent->enc;
-    sv->offset  = offset;
-    sv->length  = length;
+    sv->base        = parent->base;
+    sv->enc         = parent->enc;
+    sv->offset      = offset;
+    sv->length      = length;
+    sv->single_byte = parent->single_byte;
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -110,11 +115,13 @@ SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     string_view_t *sv;
     VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
                                      &string_view_type, sv);
+    rb_encoding *enc = rb_enc_get(backing);
     RB_OBJ_WRITE(obj, &sv->backing, backing);
-    sv->base    = RSTRING_PTR(backing);
-    sv->enc     = rb_enc_get(backing);
-    sv->offset  = offset;
-    sv->length  = length;
+    sv->base        = RSTRING_PTR(backing);
+    sv->enc         = enc;
+    sv->offset      = offset;
+    sv->length      = length;
+    sv->single_byte = sv_compute_single_byte(backing, enc);
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -127,11 +134,12 @@ static VALUE sv_alloc(VALUE klass) {
     string_view_t *sv;
     VALUE obj = TypedData_Make_Struct(klass, string_view_t,
                                      &string_view_type, sv);
-    sv->backing = Qnil;
-    sv->base    = NULL;
-    sv->enc     = NULL;
-    sv->offset  = 0;
-    sv->length  = 0;
+    sv->backing     = Qnil;
+    sv->base        = NULL;
+    sv->enc         = NULL;
+    sv->offset      = 0;
+    sv->length      = 0;
+    sv->single_byte = -1;
     return obj;
 }
 
@@ -170,11 +178,13 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     }
 
     string_view_t *sv = sv_get_struct(self);
+    rb_encoding *enc = rb_enc_get(str);
     RB_OBJ_WRITE(self, &sv->backing, str);
-    sv->base    = RSTRING_PTR(str);
-    sv->enc     = rb_enc_get(str);
-    sv->offset  = offset;
-    sv->length  = length;
+    sv->base        = RSTRING_PTR(str);
+    sv->enc         = enc;
+    sv->offset      = offset;
+    sv->length      = length;
+    sv->single_byte = sv_compute_single_byte(str, enc);
 
     rb_obj_freeze(self);
 
@@ -225,11 +235,13 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
                  off, len, backing_len);
     }
 
+    rb_encoding *enc = rb_enc_get(new_backing);
     RB_OBJ_WRITE(self, &sv->backing, new_backing);
-    sv->base   = RSTRING_PTR(new_backing);
-    sv->enc    = rb_enc_get(new_backing);
-    sv->offset = off;
-    sv->length = len;
+    sv->base        = RSTRING_PTR(new_backing);
+    sv->enc         = enc;
+    sv->offset      = off;
+    sv->length      = len;
+    sv->single_byte = sv_compute_single_byte(new_backing, enc);
 
     return self;
 }
@@ -529,22 +541,34 @@ static VALUE sv_hash(VALUE self) {
  * all bytes are ASCII (< 128) in a UTF-8 string via the backing string's
  * coderange.
  */
+/*
+ * Compute single-byte flag from encoding + coderange.
+ * Called once at construction time and cached in sv->single_byte.
+ */
+static int sv_compute_single_byte(VALUE backing, rb_encoding *enc) {
+    if (rb_enc_mbmaxlen(enc) == 1) return 1;
+    int cr = ENC_CODERANGE(backing);
+    if (cr == ENC_CODERANGE_7BIT) return 1;
+    /* For VALID (known multibyte) we know it's not single-byte */
+    if (cr == ENC_CODERANGE_VALID) return 0;
+    /* UNKNOWN: we don't know yet — return -1 (will be resolved lazily) */
+    return -1;
+}
+
 SV_INLINE int sv_single_byte_optimizable(string_view_t *sv) {
-    rb_encoding *enc = sv_enc(sv);
-    if (SV_LIKELY(rb_enc_mbmaxlen(enc) == 1)) return 1;
-    /* Check the backing string's coderange — if 7BIT, all chars are single-byte */
-    int cr = ENC_CODERANGE(sv->backing);
-    if (SV_LIKELY(cr == ENC_CODERANGE_7BIT)) return 1;
-    /* For unknown coderange, scan our slice quickly */
-    if (cr == ENC_CODERANGE_UNKNOWN) {
-        const char *p = sv_ptr(sv);
-        long i;
-        for (i = 0; i < sv->length; i++) {
-            if (SV_UNLIKELY((unsigned char)p[i] > 127)) return 0;
+    int sb = sv->single_byte;
+    if (SV_LIKELY(sb >= 0)) return sb;
+    /* Resolve unknown coderange by scanning our slice */
+    const char *p = sv_ptr(sv);
+    long i;
+    for (i = 0; i < sv->length; i++) {
+        if (SV_UNLIKELY((unsigned char)p[i] > 127)) {
+            sv->single_byte = 0;
+            return 0;
         }
-        return 1;
     }
-    return 0;
+    sv->single_byte = 1;
+    return 1;
 }
 
 static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
