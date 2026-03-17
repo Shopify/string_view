@@ -2,7 +2,6 @@ PATH
   remote: .
   specs:
     string_view (0.1.0)
-      rake-compiler
 
 GEM
   remote: https://rubygems.org/
