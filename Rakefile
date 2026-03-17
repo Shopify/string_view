@@ -2,14 +2,13 @@
 
 require "bundler/gem_tasks"
 require "rake/extensiontask"
+require "minitest/test_task"
 
 Rake::ExtensionTask.new("string_view") do |ext|
   ext.lib_dir = "lib/string_view"
 end
 
-task :test do
-  sh "ruby -Ilib -Itest test/test_string_view.rb"
-end
+Minitest::TestTask.create
 
 # Compile the extension before running tests
 task test: :compile
