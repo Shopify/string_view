@@ -1,7 +1,15 @@
 # frozen_string_literal: true
 
 require_relative "string_view/version"
-require_relative "string_view/string_view"
+
+begin
+  # Load the precompiled binary for this Ruby version (from cibuildgem)
+  ruby_version = RUBY_VERSION[/^\d+\.\d+/]
+  require_relative "string_view/#{ruby_version}/string_view"
+rescue LoadError
+  # Fall back to the locally compiled extension
+  require_relative "string_view/string_view"
+end
 
 class StringView
   # method_missing safety net:
