@@ -191,10 +191,20 @@ class TestStringMethodCoverage < Minitest::Test
   end
 
   def test_no_phantom_methods_in_lists
-    # Make sure we haven't listed methods that don't exist on String at all
+    # Make sure we haven't listed methods that don't exist on String at all.
+    # Some methods in our lists may only exist in newer Ruby versions (e.g.
+    # append_as_bytes in 3.4+, dedup in 4.0+). That's OK — they're listed
+    # for forward compatibility. We only flag methods that have been removed.
     all_string_methods = String.instance_methods
     all_listed = IMPLEMENTED + OPERATORS + FROZEN_BANG_METHODS + NOT_IMPLEMENTED
-    phantoms = all_listed - all_string_methods - STRINGVIEW_SPECIFIC
+
+    # Filter to only methods that don't exist on String AND are not
+    # known to be version-dependent additions.
+    version_dependent = [
+      :append_as_bytes, # 3.4+
+      :dedup,           # 4.0+
+    ]
+    phantoms = all_listed - all_string_methods - STRINGVIEW_SPECIFIC - version_dependent
 
     assert_empty(
       phantoms,
@@ -254,11 +264,11 @@ class TestStringMethodCoverage < Minitest::Test
     sv = StringView.new("hello")
 
     # These should raise NotImplementedError via method_missing.
-    # Skip methods that are private on StringView (to_str) — method_missing
-    # won't be called for those, Ruby dispatches them directly.
+    # Skip methods that are private on StringView (to_str), and methods
+    # that don't exist on String in this Ruby version.
     skipped = [:to_str]
 
-    (NOT_IMPLEMENTED - skipped).each do |method|
+    (NOT_IMPLEMENTED - skipped).select { |m| String.method_defined?(m) }.each do |method|
       assert_raises(
         NotImplementedError,
         "StringView##{method} should raise NotImplementedError",
