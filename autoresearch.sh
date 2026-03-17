@@ -3,86 +3,72 @@ set -euo pipefail
 
 # Pre-check: compile
 make clean >/dev/null 2>&1 || true
+ruby ext/string_view/extconf.rb >/dev/null 2>&1
 make >/dev/null 2>&1 || { echo "COMPILE FAILED"; exit 1; }
 cp string_view.bundle lib/string_view/
 
 # Pre-check: tests pass
 ruby -Ilib -Itest test/test_string_view.rb >/dev/null 2>&1 || { echo "TESTS FAILED"; exit 1; }
 
-# Run the benchmark — outputs METRIC lines
+# Run the benchmark
 exec ruby --yjit -Ilib -e '
 require "string_view"
 require "benchmark"
 
-SIZE = 1_000_000
-LARGE = ("a" * (SIZE / 2) + "NEEDLE" + "b" * (SIZE / 2)).freeze
-SV_LARGE = StringView.new(LARGE)
+# --- Setup ---
+ASCII_STR = ("Hello world! " * 10_000).freeze
+SV_ASCII = StringView.new(ASCII_STR)
 
-STR_INNER = LARGE[250_000, 500_000]
-SV_INNER  = SV_LARGE[250_000, 500_000]
+UTF8_STR = ("日本語テスト🎉café " * 5_000).freeze
+SV_UTF8 = StringView.new(UTF8_STR)
 
-N_SLICE = 200_000
-N_ACC   = 2_000_000
-N_COMBO = 100_000
-N_MULTI = 5_000
+BINARY_STR = ("\x00\x01\x02\xFF\xFE\xFD".b * 20_000).freeze
+SV_BINARY = StringView.new(BINARY_STR)
 
-# --- Slice creation (inner 500KB) ---
-t = Benchmark.realtime { N_SLICE.times { SV_LARGE[250_000, 500_000] } }
-sv_slice_ips = (N_SLICE / t).round
-t = Benchmark.realtime { N_SLICE.times { LARGE[250_000, 500_000] } }
-str_slice_ips = (N_SLICE / t).round
-puts "METRIC sv_slice_500k=#{sv_slice_ips}"
-puts "METRIC str_slice_500k=#{str_slice_ips}"
-puts "METRIC slice_500k_ratio=#{"%.2f" % (sv_slice_ips.to_f / str_slice_ips)}"
+$stderr.puts "ASCII:  #{ASCII_STR.bytesize}B/#{ASCII_STR.length}ch  UTF8: #{UTF8_STR.bytesize}B/#{UTF8_STR.length}ch  Bin: #{BINARY_STR.bytesize}B/#{BINARY_STR.length}ch"
 
-# --- bytesize on pre-existing slice ---
-t = Benchmark.realtime { N_ACC.times { SV_INNER.bytesize } }
-sv_bs_ips = (N_ACC / t).round
-t = Benchmark.realtime { N_ACC.times { STR_INNER.bytesize } }
-str_bs_ips = (N_ACC / t).round
-puts "METRIC sv_bytesize=#{sv_bs_ips}"
-puts "METRIC str_bytesize=#{str_bs_ips}"
-puts "METRIC bytesize_ratio=#{"%.2f" % (sv_bs_ips.to_f / str_bs_ips)}"
+def bench(n)
+  t = Benchmark.realtime { n.times { yield } }
+  (n / t).round
+end
 
-# --- getbyte on pre-existing slice ---
-t = Benchmark.realtime { N_ACC.times { SV_INNER.getbyte(250_000) } }
-sv_gb_ips = (N_ACC / t).round
-t = Benchmark.realtime { N_ACC.times { STR_INNER.getbyte(250_000) } }
-str_gb_ips = (N_ACC / t).round
-puts "METRIC sv_getbyte=#{sv_gb_ips}"
-puts "METRIC str_getbyte=#{str_gb_ips}"
-puts "METRIC getbyte_ratio=#{"%.2f" % (sv_gb_ips.to_f / str_gb_ips)}"
+def report(name, sv_ips, str_ips)
+  ratio = sv_ips.to_f / str_ips
+  puts "METRIC sv_#{name}=#{sv_ips}"
+  puts "METRIC str_#{name}=#{str_ips}"
+  puts "METRIC #{name}_ratio=#{"%.2f" % ratio}"
+end
 
-# --- start_with? on pre-existing slice ---
-t = Benchmark.realtime { N_ACC.times { SV_INNER.start_with?("xxxxx") } }
-sv_sw_ips = (N_ACC / t).round
-t = Benchmark.realtime { N_ACC.times { STR_INNER.start_with?("xxxxx") } }
-str_sw_ips = (N_ACC / t).round
-puts "METRIC sv_start_with=#{sv_sw_ips}"
-puts "METRIC str_start_with=#{str_sw_ips}"
-puts "METRIC start_with_ratio=#{"%.2f" % (sv_sw_ips.to_f / str_sw_ips)}"
+scores = []
 
-# --- Combined: slice + start_with? ---
-t = Benchmark.realtime { N_COMBO.times { SV_LARGE[250_000, 500_000].start_with?("aaa") } }
-sv_combo_ips = (N_COMBO / t).round
-t = Benchmark.realtime { N_COMBO.times { LARGE[250_000, 500_000].start_with?("aaa") } }
-str_combo_ips = (N_COMBO / t).round
-puts "METRIC sv_slice_start_with=#{sv_combo_ips}"
-puts "METRIC str_slice_start_with=#{str_combo_ips}"
-puts "METRIC slice_start_with_ratio=#{"%.2f" % (sv_combo_ips.to_f / str_combo_ips)}"
+# --- length ---
+sv = bench(500_000) { SV_ASCII.length }; st = bench(500_000) { ASCII_STR.length }
+report("ascii_length", sv, st); scores << sv
 
-# --- 50 inner slices ---
-offsets = Array.new(50) { |i| [i * 10_000 + 100_000, 5_000] }
-t = Benchmark.realtime { N_MULTI.times { offsets.each { |off, len| SV_LARGE[off, len] } } }
-sv_multi_ips = (N_MULTI / t).round
-t = Benchmark.realtime { N_MULTI.times { offsets.each { |off, len| LARGE[off, len] } } }
-str_multi_ips = (N_MULTI / t).round
-puts "METRIC sv_50_slices=#{sv_multi_ips}"
-puts "METRIC str_50_slices=#{str_multi_ips}"
-puts "METRIC multi_slice_ratio=#{"%.2f" % (sv_multi_ips.to_f / str_multi_ips)}"
+sv = bench(5_000) { SV_UTF8.length }; st = bench(5_000) { UTF8_STR.length }
+report("utf8_length", sv, st); scores << sv
 
-# --- Composite score: geometric mean of all SV i/s values ---
-sv_scores = [sv_slice_ips, sv_bs_ips, sv_gb_ips, sv_sw_ips, sv_combo_ips, sv_multi_ips]
-composite = (sv_scores.inject(1.0) { |prod, v| prod * v } ** (1.0 / sv_scores.size)).round
+sv = bench(500_000) { SV_BINARY.length }; st = bench(500_000) { BINARY_STR.length }
+report("binary_length", sv, st); scores << sv
+
+# --- slice [char_idx, char_len] ---
+ac = ASCII_STR.length
+sv = bench(200_000) { SV_ASCII[ac/4, ac/2] }; st = bench(200_000) { ASCII_STR[ac/4, ac/2] }
+report("ascii_slice", sv, st); scores << sv
+
+uc = UTF8_STR.length
+sv = bench(5_000) { SV_UTF8[uc/4, uc/2] }; st = bench(5_000) { UTF8_STR[uc/4, uc/2] }
+report("utf8_slice", sv, st); scores << sv
+
+bc = BINARY_STR.length
+sv = bench(200_000) { SV_BINARY[bc/4, bc/2] }; st = bench(200_000) { BINARY_STR[bc/4, bc/2] }
+report("binary_slice", sv, st); scores << sv
+
+# --- slice + include? (UTF-8) ---
+sv = bench(5_000) { SV_UTF8[uc/4, uc/2].include?("café") }
+st = bench(5_000) { UTF8_STR[uc/4, uc/2].include?("café") }
+report("utf8_slice_include", sv, st); scores << sv
+
+composite = (scores.inject(1.0) { |p, v| p * v } ** (1.0 / scores.size)).round
 puts "METRIC composite=#{composite}"
 '

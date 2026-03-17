@@ -255,12 +255,12 @@ static VALUE sv_bytesize(VALUE self) {
     return LONG2NUM(sv->length);
 }
 
+/* Forward: sv_char_count is defined in Tier 2 but needed here */
+static long sv_char_count(string_view_t *sv);
+
 static VALUE sv_length(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv);
-    long chars = rb_enc_strlen(p, p + sv->length, enc);
-    return LONG2NUM(chars);
+    return LONG2NUM(sv_char_count(sv));
 }
 
 static VALUE sv_empty_p(VALUE self) {
@@ -384,7 +384,7 @@ static VALUE sv_each_char(VALUE self) {
     const char *p = sv_ptr(sv);
     const char *e = p + sv->length;
     while (p < e) {
-        int clen = rb_enc_mbclen(p, e, enc);
+        int clen = rb_enc_fast_mbclen(p, e, enc);
         rb_yield(rb_enc_str_new(p, clen, enc));
         p += clen;
     }
@@ -409,7 +409,7 @@ static VALUE sv_chars(VALUE self) {
     const char *e = p + sv->length;
     VALUE ary = rb_ary_new();
     while (p < e) {
-        int clen = rb_enc_mbclen(p, e, enc);
+        int clen = rb_enc_fast_mbclen(p, e, enc);
         rb_ary_push(ary, rb_enc_str_new(p, clen, enc));
         p += clen;
     }
@@ -571,9 +571,122 @@ SV_INLINE int sv_single_byte_optimizable(string_view_t *sv) {
     return 1;
 }
 
+/* ---- UTF-8 optimized helpers ------------------------------------------- */
+
+static rb_encoding *enc_utf8 = NULL;
+
+SV_INLINE int sv_is_utf8(string_view_t *sv) {
+    return sv->enc == enc_utf8;
+}
+
+/*
+ * In UTF-8, continuation bytes have the form 10xxxxxx (0x80..0xBF).
+ * A byte is a lead byte (starts a new character) iff it's NOT a continuation.
+ * So: char_count = number of bytes where (byte & 0xC0) != 0x80.
+ *
+ * We process 8 bytes at a time using bitwise tricks:
+ *   For each byte b, (b & 0xC0) == 0x80 means continuation.
+ *   Equivalently: ((b ^ 0x80) & 0xC0) == 0 means continuation.
+ *   Count non-continuations = total_bytes - continuation_count.
+ */
+static long sv_utf8_char_count(const char *p, long len) {
+    const unsigned char *s = (const unsigned char *)p;
+    const unsigned char *e = s + len;
+    long count = 0;
+
+    /* Process 8 bytes at a time */
+    while (s + 8 <= e) {
+        /* Count continuation bytes in this chunk */
+        unsigned int cont = 0;
+        cont += ((s[0] & 0xC0) == 0x80);
+        cont += ((s[1] & 0xC0) == 0x80);
+        cont += ((s[2] & 0xC0) == 0x80);
+        cont += ((s[3] & 0xC0) == 0x80);
+        cont += ((s[4] & 0xC0) == 0x80);
+        cont += ((s[5] & 0xC0) == 0x80);
+        cont += ((s[6] & 0xC0) == 0x80);
+        cont += ((s[7] & 0xC0) == 0x80);
+        count += 8 - cont;
+        s += 8;
+    }
+
+    /* Remaining bytes */
+    while (s < e) {
+        if ((*s & 0xC0) != 0x80) count++;
+        s++;
+    }
+
+    return count;
+}
+
+/*
+ * UTF-8 character byte length from the lead byte, via lookup table.
+ * Assumes valid UTF-8 (which is guaranteed by Ruby's frozen backing).
+ */
+static const unsigned char utf8_char_len[256] = {
+    /* 0x00-0x7F: ASCII, 1 byte */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0x80-0xBF: continuation bytes — shouldn't be lead bytes, treat as 1 */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0xC0-0xDF: 2-byte sequences */
+    2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+    /* 0xE0-0xEF: 3-byte sequences */
+    3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+    /* 0xF0-0xF7: 4-byte sequences */
+    4,4,4,4,4,4,4,4,
+    /* 0xF8-0xFF: invalid, treat as 1 */
+    1,1,1,1,1,1,1,1
+};
+
+/*
+ * Find the byte offset of the char_idx-th character in a UTF-8 string.
+ * Uses a lookup table for branchless character width.
+ */
+static long sv_utf8_char_to_byte_offset(const char *p, long len, long char_idx) {
+    const unsigned char *s = (const unsigned char *)p;
+    const unsigned char *e = s + len;
+    long chars = 0;
+
+    while (s < e && chars < char_idx) {
+        s += utf8_char_len[*s];
+        chars++;
+    }
+
+    if (chars < char_idx) return -1;
+    return (const char *)s - p;
+}
+
+/*
+ * Count byte length for n characters starting at byte offset byte_off
+ * in a UTF-8 string.
+ */
+static long sv_utf8_chars_to_bytes(const char *p, long len, long byte_off, long n) {
+    const unsigned char *s = (const unsigned char *)p + byte_off;
+    const unsigned char *e = (const unsigned char *)p + len;
+    const unsigned char *start = s;
+    long chars = 0;
+
+    while (s < e && chars < n) {
+        s += utf8_char_len[*s];
+        chars++;
+    }
+
+    return (long)(s - start);
+}
+
+/* ---- Generic encoding helpers with UTF-8 fast paths -------------------- */
+
 static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
     if (sv_single_byte_optimizable(sv)) {
         return char_idx;
+    }
+
+    if (SV_LIKELY(sv_is_utf8(sv))) {
+        return sv_utf8_char_to_byte_offset(sv_ptr(sv), sv->length, char_idx);
     }
 
     rb_encoding *enc = sv_enc(sv);
@@ -583,7 +696,7 @@ static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
     long i;
 
     for (i = 0; i < char_idx && p < e; i++) {
-        p += rb_enc_mbclen(p, e, enc);
+        p += rb_enc_fast_mbclen(p, e, enc);
     }
 
     if (i < char_idx) return -1;
@@ -594,6 +707,11 @@ static long sv_char_count(string_view_t *sv) {
     if (sv_single_byte_optimizable(sv)) {
         return sv->length;
     }
+
+    if (SV_LIKELY(sv_is_utf8(sv))) {
+        return sv_utf8_char_count(sv_ptr(sv), sv->length);
+    }
+
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv);
     return rb_enc_strlen(p, p + sv->length, enc);
@@ -601,10 +719,14 @@ static long sv_char_count(string_view_t *sv) {
 
 static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
     if (sv_single_byte_optimizable(sv)) {
-        /* Clamp n to remaining bytes */
         long remaining = sv->length - byte_off;
         return n < remaining ? n : remaining;
     }
+
+    if (SV_LIKELY(sv_is_utf8(sv))) {
+        return sv_utf8_chars_to_bytes(sv_ptr(sv), sv->length, byte_off, n);
+    }
+
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv) + byte_off;
     const char *e = sv_ptr(sv) + sv->length;
@@ -612,7 +734,7 @@ static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
     const char *start = p;
 
     for (i = 0; i < n && p < e; i++) {
-        p += rb_enc_mbclen(p, e, enc);
+        p += rb_enc_fast_mbclen(p, e, enc);
     }
     return p - start;
 }
@@ -859,6 +981,8 @@ static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
 /* ========================================================================= */
 
 void Init_string_view(void) {
+    enc_utf8 = rb_utf8_encoding();
+
     cStringView = rb_define_class("StringView", rb_cObject);
     rb_include_module(cStringView, rb_mComparable);
 
