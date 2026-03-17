@@ -23,6 +23,7 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir.glob([
     "LICENSE.txt",
+    "LICENSE-simdutf.txt",
     "README.md",
     "Rakefile",
     "lib/**/*.rb",

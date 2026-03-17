@@ -253,7 +253,7 @@ ruby --yjit -Ilib benchmark/bench.rb
 
 The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
 
-simdutf is included under the [Apache License 2.0 / MIT dual license](https://github.com/simdutf/simdutf/blob/master/LICENSE-APACHE).
+simdutf is included under the [MIT License](https://github.com/simdutf/simdutf/blob/master/LICENSE-MIT) (also available under Apache 2.0). See [LICENSE-simdutf.txt](LICENSE-simdutf.txt) for the full text.
 
 ## Code of Conduct
 
