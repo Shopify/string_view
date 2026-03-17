@@ -1023,11 +1023,10 @@ class TestStringView < Minitest::Test
 
   def test_dangling_after_gc_collects_backing
     sv = StringView.new(+"hello world")
-    sv.weaken!
-    # The only strong reference to the backing string is gone.
-    # The WeakMap holds it weakly. Force GC.
+    # The only strong reference to the backing is the +content temporary
+    # which is now out of scope. The view holds it weakly. Force GC.
     GC.start
-    GC.start # run twice to be thorough
+    GC.start
 
     # The backing may or may not have been collected depending on GC behavior,
     # but if it was, dangling? should be true and access should raise.
@@ -1152,11 +1151,10 @@ class TestStringView < Minitest::Test
   private
 
   # Helper: create a StringView whose backing has no strong references.
-  # The view is weakened so the GC _may_ collect the backing.
+  # All views are non-owning, so the GC _may_ collect the backing.
   # We aggressively GC to maximize the chance.
   def make_dangling_view(content)
     sv = StringView.new(+content)
-    sv.weaken!
     # At this point, the only reference to the frozen backing is the weak ref
     # inside the WeakMap. Force GC to try to collect it.
     4.times { GC.start }
