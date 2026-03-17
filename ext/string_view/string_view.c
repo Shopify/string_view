@@ -764,17 +764,47 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
                                        len);
         }
 
-        /* Slow path: multibyte encoding */
-        long total_chars = sv_char_count(sv);
-        if (idx < 0) idx += total_chars;
-        if (idx < 0 || idx > total_chars) return Qnil;
+        /* Multibyte path */
         if (len < 0) return Qnil;
 
+        if (idx < 0) {
+            /* Negative index: need total char count */
+            long total_chars = sv_char_count(sv);
+            idx += total_chars;
+            if (idx < 0) return Qnil;
+        }
+
+        if (SV_LIKELY(sv_is_utf8(sv))) {
+            /* UTF-8 combined single-pass: find byte_off for idx chars,
+             * then continue scanning len more chars for byte_len */
+            const unsigned char *s = (const unsigned char *)sv_ptr(sv);
+            const unsigned char *e = s + sv->length;
+            long chars = 0;
+
+            /* Phase 1: skip idx characters to find byte_off */
+            while (s < e && chars < idx) {
+                s += utf8_char_len[*s];
+                chars++;
+            }
+            if (chars < idx) return Qnil;
+
+            const unsigned char *slice_start = s;
+
+            /* Phase 2: skip len more characters to find byte_len */
+            long counted = 0;
+            while (s < e && counted < len) {
+                s += utf8_char_len[*s];
+                counted++;
+            }
+
+            return sv_new_from_parent(sv,
+                                       sv->offset + (long)((const char *)slice_start - (const char *)sv_ptr(sv)),
+                                       (long)(s - slice_start));
+        }
+
+        /* Generic multibyte fallback */
         long byte_off = sv_char_to_byte_offset(sv, idx);
         if (byte_off < 0) return Qnil;
-
-        long remaining_chars = total_chars - idx;
-        if (len > remaining_chars) len = remaining_chars;
 
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
 
