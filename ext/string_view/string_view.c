@@ -236,6 +236,17 @@ static VALUE sv_to_s(VALUE self) {
     return rb_enc_str_new(sv_ptr(sv), sv->length, sv_enc(sv));
 }
 
+/*
+ * to_str: implicit String coercion.
+ * Returns a frozen shared string (zero-copy for heap-allocated backings).
+ * This enables StringView to work with Regexp#=~, IO#write, and other
+ * Ruby methods that call to_str for implicit coercion.
+ */
+static VALUE sv_to_str(VALUE self) {
+    string_view_t *sv = sv_get_struct(self);
+    return sv_as_shared_str(sv);
+}
+
 static VALUE sv_inspect(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE content = rb_enc_str_new(sv_ptr(sv), sv->length, sv_enc(sv));
@@ -1068,6 +1079,7 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "initialize", sv_initialize, -1);
 
     rb_define_method(cStringView, "to_s",       sv_to_s,       0);
+    rb_define_private_method(cStringView, "to_str", sv_to_str, 0);
     rb_define_method(cStringView, "inspect",    sv_inspect,    0);
     rb_define_method(cStringView, "frozen?",    sv_frozen_p,   0);
     rb_define_method(cStringView, "reset!",     sv_reset,      3);
