@@ -21,6 +21,7 @@ typedef struct {
     rb_encoding *enc;   /* cached encoding — avoids rb_enc_get per call */
     long   offset;      /* byte offset into backing */
     long   length;      /* byte length of this view */
+    long   charlen;     /* cached character count; -1 = not yet computed */
     int    single_byte; /* cached: 1 if char==byte (ASCII/single-byte enc), 0 if multibyte, -1 unknown */
 } string_view_t;
 
@@ -106,6 +107,7 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = parent->single_byte;
+    sv->charlen     = -1;
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -122,6 +124,7 @@ SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = sv_compute_single_byte(backing, enc);
+    sv->charlen     = -1;
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -140,6 +143,7 @@ static VALUE sv_alloc(VALUE klass) {
     sv->offset      = 0;
     sv->length      = 0;
     sv->single_byte = -1;
+    sv->charlen     = -1;
     return obj;
 }
 
@@ -185,6 +189,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = sv_compute_single_byte(str, enc);
+    sv->charlen     = -1;
 
     rb_obj_freeze(self);
 
@@ -242,6 +247,7 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv->offset      = off;
     sv->length      = len;
     sv->single_byte = sv_compute_single_byte(new_backing, enc);
+    sv->charlen     = -1;
 
     return self;
 }
@@ -704,17 +710,22 @@ static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
 }
 
 static long sv_char_count(string_view_t *sv) {
+    /* Return cached value if available */
+    if (SV_LIKELY(sv->charlen >= 0)) return sv->charlen;
+
+    long count;
     if (sv_single_byte_optimizable(sv)) {
-        return sv->length;
+        count = sv->length;
+    } else if (SV_LIKELY(sv_is_utf8(sv))) {
+        count = sv_utf8_char_count(sv_ptr(sv), sv->length);
+    } else {
+        rb_encoding *enc = sv_enc(sv);
+        const char *p = sv_ptr(sv);
+        count = rb_enc_strlen(p, p + sv->length, enc);
     }
 
-    if (SV_LIKELY(sv_is_utf8(sv))) {
-        return sv_utf8_char_count(sv_ptr(sv), sv->length);
-    }
-
-    rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv);
-    return rb_enc_strlen(p, p + sv->length, enc);
+    sv->charlen = count;
+    return count;
 }
 
 static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
