@@ -9,7 +9,6 @@
 /lib/string_view/string_view.bundle
 /lib/string_view/string_view.so
 /lib/string_view/string_view.o
-Gemfile.lock
 Makefile
 *.o
 *.bundle
