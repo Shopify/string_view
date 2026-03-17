@@ -63,3 +63,26 @@ the GC. Key hot paths:
   Store `RSTRING_PTR(backing)` and `rb_enc_get(backing)` at construction time. `sv_ptr()` and
   `sv_enc()` now read cached fields. `sv_compact` updates base when GC moves backing.
   Slicing 500KB now 83x faster than String.
+- **rb_obj_class instead of rb_obj_is_kind_of** in comparisons: Marginal, but cleaner.
+- **RUBY_TYPED_EMBEDDABLE** (composite ~11.4M -> ~12.5M, +10%): Embed struct directly in
+  Ruby object memory. Eliminates separate xmalloc/xfree per object and one pointer
+  indirection. Inner slice 500KB went to 133x faster than String.
+- **RTYPEDDATA_GET_DATA direct** (composite ~12.5M, +10%): Skip TypedData type check in
+  sv_get_struct since Ruby method dispatch already ensures correct type.
+- **sv_new_from_parent** (composite ~12.9M, +3%): Pass parent's cached base/enc to child
+  views instead of re-deriving from backing VALUE.
+- **Cached single_byte flag** (marginal): Compute once at construction, propagate to children.
+- **Inline ASCII fast path in sv_aref** (marginal): For `sv[i, len]` with ASCII content,
+  skip char_count/char_to_byte_offset/chars_to_bytes — just do direct byte arithmetic.
+
+### Dead ends (no measurable improvement)
+- **-march=native**: ARM64 already uses optimal instructions.
+- **FIX2LONG fast path**: NUM2LONG already does the FIXNUM_P check internally.
+- **Pre-interned rb_intern IDs**: rb_intern caches internally; the hot paths don't call it.
+- **sv_backing_or_raise removal**: The nil check wasn't the bottleneck (TypedData unwrap was).
+
+### Performance floor
+The remaining overhead for simple accessors (~1.1-1.15x vs String) is irreducible for a
+C extension TypedData type: Ruby method dispatch + RTYPEDDATA_GET_DATA + field read.
+String's built-in macros (RSTRING_LEN, etc.) skip all of this because they operate on
+the native object layout directly.
