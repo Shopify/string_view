@@ -1012,7 +1012,9 @@ class TestStringView < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
-  # Weak references — backing can be GC'd, view becomes dangling
+  # dangling? — currently always false (strong marks keep backing alive).
+  # The API exists so that when rb_gc_mark_weak becomes public, we can
+  # switch to true non-owning semantics with zero API changes.
   # ---------------------------------------------------------------------------
 
   def test_dangling_predicate_false_when_backing_alive
@@ -1021,143 +1023,34 @@ class TestStringView < Minitest::Test
     refute_predicate sv, :dangling?
   end
 
-  def test_dangling_after_gc_collects_backing
+  def test_dangling_false_even_after_gc
     sv = StringView.new(+"hello world")
-    # The only strong reference to the backing is the +content temporary
-    # which is now out of scope. The view holds it weakly. Force GC.
+    # Strong mark keeps backing alive even though caller dropped their ref.
     GC.start
     GC.start
-
-    # The backing may or may not have been collected depending on GC behavior,
-    # but if it was, dangling? should be true and access should raise.
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.to_s }
-      assert_raises(RuntimeError) { sv.bytesize }
-      assert_raises(RuntimeError) { sv.length }
-      assert_raises(RuntimeError) { sv.include?("hello") }
-      assert_raises(RuntimeError) { sv[0] }
-      assert_raises(RuntimeError) { sv.upcase }
-    else
-      # GC didn't collect it this time — that's allowed, just verify it still works
-      assert_equal "hello world", sv.to_s
-    end
-  end
-
-  def test_dangling_view_raises_on_to_s
-    sv = make_dangling_view("hello world")
-    if sv.dangling?
-      err = assert_raises(RuntimeError) { sv.to_s }
-      assert_includes err.message, "dangling"
-    end
-  end
-
-  def test_dangling_view_raises_on_bytesize
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.bytesize }
-    end
-  end
-
-  def test_dangling_view_raises_on_length
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.length }
-    end
-  end
-
-  def test_dangling_view_raises_on_slice
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv[0] }
-    end
-  end
-
-  def test_dangling_view_raises_on_include
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.include?("test") }
-    end
-  end
-
-  def test_dangling_view_raises_on_transform
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.upcase }
-    end
-  end
-
-  def test_dangling_view_raises_on_each_byte
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.each_byte { |b| } }
-    end
-  end
-
-  def test_dangling_view_raises_on_match
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv.match(/test/) }
-    end
-  end
-
-  def test_dangling_view_raises_on_comparison
-    sv = make_dangling_view("test string")
-    if sv.dangling?
-      assert_raises(RuntimeError) { sv == "test string" }
-    end
-  end
-
-  def test_reset_revives_dangling_view
-    sv = make_dangling_view("old string")
-    # Even if dangling, reset! should work — it replaces the backing entirely
-    new_str = "new string"
-    sv.reset!(new_str, 0, 10)
-    refute_predicate sv, :dangling?
-    assert_equal "new string", sv.to_s
-  end
-
-  def test_view_kept_alive_by_strong_external_reference
-    str = +"hello world"
-    sv = StringView.new(str)
-
-    # str is still alive — the view should never become dangling
-    GC.start
-    GC.start
-
     refute_predicate sv, :dangling?
     assert_equal "hello world", sv.to_s
-
-    # str is still referenced in this scope
-    assert_equal "hello world", str
   end
 
-  def test_multiple_views_into_same_backing_all_dangle
-    sv1 = nil
-    sv2 = nil
+  def test_view_survives_gc_without_external_reference
+    sv = StringView.new(+"hello world")
+    GC.start
+    GC.start
+    # View keeps backing alive — still works
+    assert_equal "hello world", sv.to_s
+    assert_equal 11, sv.bytesize
+    assert sv.include?("world")
+  end
 
-    # Create views in a block so the backing's only strong ref is the local
+  def test_multiple_views_into_same_backing
     str = +"shared backing string"
     sv1 = StringView.new(str)
     sv2 = StringView.new(str, 7, 7) # "backing"
 
-    # While str is alive, neither should be dangling
     GC.start
     refute_predicate sv1, :dangling?
     refute_predicate sv2, :dangling?
     assert_equal "shared backing string", sv1.to_s
     assert_equal "backing", sv2.to_s
-  end
-
-  private
-
-  # Helper: create a StringView whose backing has no strong references.
-  # All views are non-owning, so the GC _may_ collect the backing.
-  # We aggressively GC to maximize the chance.
-  def make_dangling_view(content)
-    sv = StringView.new(+content)
-    # At this point, the only reference to the frozen backing is the weak ref
-    # inside the WeakMap. Force GC to try to collect it.
-    4.times { GC.start }
-    sv
   end
 end
