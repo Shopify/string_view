@@ -4,8 +4,8 @@
 #include "ruby/re.h"
 #include "simdutf_c.h"
 
-/* Ruby 4.0 added an encoding parameter to rb_memsearch */
-#if RUBY_API_VERSION_MAJOR >= 4
+/* Ruby 3.4+ added an encoding parameter to rb_memsearch */
+#if (RUBY_API_VERSION_MAJOR > 3) || (RUBY_API_VERSION_MAJOR == 3 && RUBY_API_VERSION_MINOR >= 4)
 #define SV_MEMSEARCH(xs, xl, ys, yl, enc) rb_memsearch((xs), (xl), (ys), (yl), (enc))
 #else
 #define SV_MEMSEARCH(xs, xl, ys, yl, enc) rb_memsearch((xs), (xl), (ys), (yl))
