@@ -11,7 +11,7 @@ class StringView
     if String.method_defined?(name)
       raise NotImplementedError,
         "StringView##{name} not yet implemented natively. " \
-        "Call .to_s.#{name}(...) explicitly if you need it."
+          "Call .to_s.#{name}(...) explicitly if you need it."
     else
       super
     end

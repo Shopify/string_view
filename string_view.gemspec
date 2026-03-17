@@ -10,8 +10,8 @@ Gem::Specification.new do |spec|
 
   spec.summary = "Zero-copy string slicing for Ruby via a C extension."
   spec.description = "StringView provides a read-only, zero-copy view into a frozen " \
-                     "Ruby String, avoiding intermediate allocations for slicing, " \
-                     "searching, and delegation of transform methods."
+    "Ruby String, avoiding intermediate allocations for slicing, " \
+    "searching, and delegation of transform methods."
   spec.homepage = "https://github.com/Shopify/string_view"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.3.0"
@@ -20,10 +20,10 @@ Gem::Specification.new do |spec|
 
   # Specify which files should be added to the gem when it is released.
   gemspec = File.basename(__FILE__)
-  spec.files = IO.popen(%w[git ls-files -z], chdir: __dir__, err: IO::NULL) do |ls|
+  spec.files = IO.popen(["git", "ls-files", "-z"], chdir: __dir__, err: IO::NULL) do |ls|
     ls.readlines("\x0", chomp: true).reject do |f|
       (f == gemspec) ||
-        f.start_with?(*%w[bin/ Gemfile .gitignore test/ .github/ .rubocop.yml])
+        f.start_with?("bin/", "Gemfile", ".gitignore", "test/", ".github/", ".rubocop.yml")
     end
   end
   spec.bindir = "exe"
@@ -31,5 +31,5 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/string_view/extconf.rb"]
 
-  spec.add_dependency "rake-compiler"
+  spec.add_dependency("rake-compiler")
 end

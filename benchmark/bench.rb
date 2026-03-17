@@ -32,11 +32,11 @@ puts "=" * 60
 puts
 
 [1_000, 10_000, 100_000, 500_000].each do |slice_size|
-  offset = (SIZE - slice_size) / 2  # always an inner slice
+  offset = (SIZE - slice_size) / 2 # always an inner slice
   Benchmark.ips do |x|
     x.config(warmup: 2, time: 5)
-    x.report("String[#{offset}, #{slice_size}]")     { LARGE[offset, slice_size] }
-    x.report("SV[#{offset}, #{slice_size}]")          { SV_LARGE[offset, slice_size] }
+    x.report("String[#{offset}, #{slice_size}]") { LARGE[offset, slice_size] }
+    x.report("SV[#{offset}, #{slice_size}]") { SV_LARGE[offset, slice_size] }
     x.compare!
   end
   puts
@@ -96,12 +96,12 @@ puts
 
 Benchmark.ips do |x|
   x.config(warmup: 2, time: 5)
-  x.report("String: inner slice+include?") {
+  x.report("String: inner slice+include?") do
     LARGE[250_000, 500_000].include?("NEEDLE")
-  }
-  x.report("SV: inner slice+include?") {
+  end
+  x.report("SV: inner slice+include?") do
     SV_LARGE[250_000, 500_000].include?("NEEDLE")
-  }
+  end
   x.compare!
 end
 
@@ -109,12 +109,12 @@ puts
 
 Benchmark.ips do |x|
   x.config(warmup: 2, time: 5)
-  x.report("String: inner slice+start_with?") {
+  x.report("String: inner slice+start_with?") do
     LARGE[250_000, 500_000].start_with?("aaa")
-  }
-  x.report("SV: inner slice+start_with?") {
+  end
+  x.report("SV: inner slice+start_with?") do
     SV_LARGE[250_000, 500_000].start_with?("aaa")
-  }
+  end
   x.compare!
 end
 
@@ -132,12 +132,12 @@ OFFSETS = Array.new(50) { |i| [i * 10_000 + 100_000, 5_000] }
 
 Benchmark.ips do |x|
   x.config(warmup: 2, time: 5)
-  x.report("String 50 inner slices") {
+  x.report("String 50 inner slices") do
     OFFSETS.each { |off, len| LARGE[off, len] }
-  }
-  x.report("SV 50 inner slices") {
+  end
+  x.report("SV 50 inner slices") do
     OFFSETS.each { |off, len| SV_LARGE[off, len] }
-  }
+  end
   x.compare!
 end
 

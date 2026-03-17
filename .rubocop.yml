@@ -1,8 +1,11 @@
+# This file strictly follows the rules defined in the Ruby style guide:
+#   http://shopify.github.io/ruby-style-guide/
+inherit_gem:
+  rubocop-shopify: rubocop.yml
+
+plugins:
+ - rubocop-minitest
+
 AllCops:
-  TargetRubyVersion: 3.2
-
-Style/StringLiterals:
-  EnforcedStyle: double_quotes
-
-Style/StringLiteralsInInterpolation:
-  EnforcedStyle: double_quotes
+  NewCops: disable
+  SuggestExtensions: false
