@@ -17,4 +17,4 @@ require "rubocop/rake_task"
 
 RuboCop::RakeTask.new
 
-task default: :test
+task default: [:test, :rubocop]
