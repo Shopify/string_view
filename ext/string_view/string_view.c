@@ -1,6 +1,7 @@
 #include "ruby.h"
 #include "ruby/encoding.h"
 #include "ruby/re.h"
+#include "simdutf_wrapper.h"
 
 #define SV_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define SV_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -586,43 +587,11 @@ SV_INLINE int sv_is_utf8(string_view_t *sv) {
 }
 
 /*
- * In UTF-8, continuation bytes have the form 10xxxxxx (0x80..0xBF).
- * A byte is a lead byte (starts a new character) iff it's NOT a continuation.
- * So: char_count = number of bytes where (byte & 0xC0) != 0x80.
- *
- * We process 8 bytes at a time using bitwise tricks:
- *   For each byte b, (b & 0xC0) == 0x80 means continuation.
- *   Equivalently: ((b ^ 0x80) & 0xC0) == 0 means continuation.
- *   Count non-continuations = total_bytes - continuation_count.
+ * UTF-8 character count using simdutf — SIMD-accelerated (NEON/SSE/AVX).
+ * Processes billions of characters per second on modern hardware.
  */
 static long sv_utf8_char_count(const char *p, long len) {
-    const unsigned char *s = (const unsigned char *)p;
-    const unsigned char *e = s + len;
-    long count = 0;
-
-    /* Process 8 bytes at a time */
-    while (s + 8 <= e) {
-        /* Count continuation bytes in this chunk */
-        unsigned int cont = 0;
-        cont += ((s[0] & 0xC0) == 0x80);
-        cont += ((s[1] & 0xC0) == 0x80);
-        cont += ((s[2] & 0xC0) == 0x80);
-        cont += ((s[3] & 0xC0) == 0x80);
-        cont += ((s[4] & 0xC0) == 0x80);
-        cont += ((s[5] & 0xC0) == 0x80);
-        cont += ((s[6] & 0xC0) == 0x80);
-        cont += ((s[7] & 0xC0) == 0x80);
-        count += 8 - cont;
-        s += 8;
-    }
-
-    /* Remaining bytes */
-    while (s < e) {
-        if ((*s & 0xC0) != 0x80) count++;
-        s++;
-    }
-
-    return count;
+    return (long)simdutf_count_utf8(p, (size_t)len);
 }
 
 /*
