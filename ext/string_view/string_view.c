@@ -529,17 +529,41 @@ static VALUE sv_hash(VALUE self) {
 /* Tier 2: Slicing — returns StringView                                      */
 /* ========================================================================= */
 
-static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
+/*
+ * Returns true if this view's content is single-byte: either the encoding
+ * has mbmaxlen==1 (e.g. ASCII, ISO-8859-*) or we can quickly determine
+ * all bytes are ASCII (< 128) in a UTF-8 string via the backing string's
+ * coderange.
+ */
+static int sv_single_byte_optimizable(string_view_t *sv) {
     rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv);
-    const char *e = p + sv->length;
-    long i;
+    if (rb_enc_mbmaxlen(enc) == 1) return 1;
+    /* Check the backing string's coderange — if 7BIT, all chars are single-byte */
+    int cr = ENC_CODERANGE(sv->backing);
+    if (cr == ENC_CODERANGE_7BIT) return 1;
+    /* For unknown coderange, scan our slice quickly */
+    if (cr == ENC_CODERANGE_UNKNOWN) {
+        const char *p = sv_ptr(sv);
+        long i;
+        for (i = 0; i < sv->length; i++) {
+            if ((unsigned char)p[i] > 127) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
 
-    if (rb_enc_mbmaxlen(enc) == 1) {
+static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
+    if (sv_single_byte_optimizable(sv)) {
         return char_idx;
     }
 
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
     const char *start = p;
+    long i;
+
     for (i = 0; i < char_idx && p < e; i++) {
         p += rb_enc_mbclen(p, e, enc);
     }
@@ -549,12 +573,20 @@ static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
 }
 
 static long sv_char_count(string_view_t *sv) {
+    if (sv_single_byte_optimizable(sv)) {
+        return sv->length;
+    }
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv);
     return rb_enc_strlen(p, p + sv->length, enc);
 }
 
 static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
+    if (sv_single_byte_optimizable(sv)) {
+        /* Clamp n to remaining bytes */
+        long remaining = sv->length - byte_off;
+        return n < remaining ? n : remaining;
+    }
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv) + byte_off;
     const char *e = sv_ptr(sv) + sv->length;
