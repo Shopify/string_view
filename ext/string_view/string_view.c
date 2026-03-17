@@ -2,6 +2,15 @@
 #include "ruby/encoding.h"
 #include "ruby/re.h"
 
+#define SV_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define SV_UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+#ifdef __GNUC__
+#define SV_INLINE static inline __attribute__((always_inline))
+#else
+#define SV_INLINE static inline
+#endif
+
 /* ========================================================================= */
 /* Struct & TypedData                                                        */
 /* ========================================================================= */
@@ -52,26 +61,26 @@ static const rb_data_type_t string_view_type = {
     "StringView",
     { sv_mark, sv_free, sv_memsize, sv_compact },
     0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE
 };
 
 /* ========================================================================= */
 /* Internal helpers                                                          */
 /* ========================================================================= */
 
-static string_view_t *sv_get_struct(VALUE self) {
+SV_INLINE string_view_t *sv_get_struct(VALUE self) {
     string_view_t *sv;
     TypedData_Get_Struct(self, string_view_t, &string_view_type, sv);
     return sv;
 }
 
 /* Pointer to the start of this view's bytes */
-static const char *sv_ptr(string_view_t *sv) {
+SV_INLINE const char *sv_ptr(string_view_t *sv) {
     return RSTRING_PTR(sv->backing) + sv->offset;
 }
 
 /* encoding of the backing string */
-static rb_encoding *sv_enc(string_view_t *sv) {
+SV_INLINE rb_encoding *sv_enc(string_view_t *sv) {
     return rb_enc_get(sv->backing);
 }
 
@@ -86,14 +95,14 @@ static VALUE sv_as_shared_str(string_view_t *sv) {
 }
 
 /* Allocate a new StringView VALUE pointing into the same backing */
-static VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
+SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     string_view_t *sv;
     VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
                                      &string_view_type, sv);
     RB_OBJ_WRITE(obj, &sv->backing, backing);
     sv->offset  = offset;
     sv->length  = length;
-    rb_obj_freeze(obj);
+    FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
 
@@ -499,18 +508,18 @@ static VALUE sv_hash(VALUE self) {
  * all bytes are ASCII (< 128) in a UTF-8 string via the backing string's
  * coderange.
  */
-static int sv_single_byte_optimizable(string_view_t *sv) {
+SV_INLINE int sv_single_byte_optimizable(string_view_t *sv) {
     rb_encoding *enc = sv_enc(sv);
-    if (rb_enc_mbmaxlen(enc) == 1) return 1;
+    if (SV_LIKELY(rb_enc_mbmaxlen(enc) == 1)) return 1;
     /* Check the backing string's coderange — if 7BIT, all chars are single-byte */
     int cr = ENC_CODERANGE(sv->backing);
-    if (cr == ENC_CODERANGE_7BIT) return 1;
+    if (SV_LIKELY(cr == ENC_CODERANGE_7BIT)) return 1;
     /* For unknown coderange, scan our slice quickly */
     if (cr == ENC_CODERANGE_UNKNOWN) {
         const char *p = sv_ptr(sv);
         long i;
         for (i = 0; i < sv->length; i++) {
-            if ((unsigned char)p[i] > 127) return 0;
+            if (SV_UNLIKELY((unsigned char)p[i] > 127)) return 0;
         }
         return 1;
     }
@@ -568,9 +577,13 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
-    rb_scan_args(argc, argv, "11", &arg1, &arg2);
+    if (SV_UNLIKELY(argc < 1 || argc > 2)) {
+        rb_error_arity(argc, 1, 2);
+    }
+    arg1 = argv[0];
+    arg2 = (argc == 2) ? argv[1] : Qnil;
 
-    if (!NIL_P(arg2)) {
+    if (argc == 2) {
         long char_idx = NUM2LONG(arg1);
         long char_len = NUM2LONG(arg2);
         long total_chars = sv_char_count(sv);
