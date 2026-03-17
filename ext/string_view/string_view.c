@@ -1021,6 +1021,10 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
     static VALUE sv_##cname(int argc, VALUE *argv, VALUE self) {        \
         string_view_t *sv = sv_get_struct(self);                        \
         VALUE shared = sv_as_shared_str(sv);                            \
+        if (rb_block_given_p()) {                                       \
+            return rb_funcall_with_block(shared, rb_intern(rbname),     \
+                                         argc, argv, rb_block_proc()); \
+        }                                                               \
         return rb_funcallv(shared, rb_intern(rbname), argc, argv);      \
     }
 

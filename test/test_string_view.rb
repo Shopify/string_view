@@ -1012,6 +1012,392 @@ class TestStringView < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
+  # Tier 3: Additional transform coverage
+  # ---------------------------------------------------------------------------
+
+  def test_materialize_is_alias_for_to_s
+    sv = StringView.new("hello")
+    result = sv.materialize
+    assert_instance_of(String, result)
+    assert_equal("hello", result)
+  end
+
+  def test_scrub
+    # Invalid UTF-8 byte sequence
+    bad = "hello \xFF world".b.force_encoding("UTF-8")
+    sv = StringView.new(bad)
+    result = sv.scrub("?")
+    assert_instance_of(String, result)
+    assert_includes(result, "hello")
+    assert_includes(result, "?")
+  end
+
+  def test_unicode_normalize
+    # é as e + combining accent (NFD) -> single é (NFC)
+    nfd = "e\u0301" # NFD form
+    sv = StringView.new(nfd)
+    result = sv.unicode_normalize(:nfc)
+    assert_instance_of(String, result)
+    assert_equal("é", result)
+  end
+
+  def test_tr_s
+    sv = StringView.new("hello")
+    result = sv.tr_s("lo", "r")
+    assert_instance_of(String, result)
+    assert_equal("her", result)
+  end
+
+  def test_gsub_with_regex
+    sv = StringView.new("hello world")
+    result = sv.gsub(/[aeiou]/, "*")
+    assert_instance_of(String, result)
+    assert_equal("h*ll* w*rld", result)
+  end
+
+  def test_sub_with_regex
+    sv = StringView.new("hello world")
+    result = sv.sub(/[aeiou]/, "*")
+    assert_instance_of(String, result)
+    assert_equal("h*llo world", result)
+  end
+
+  def test_gsub_with_block
+    sv = StringView.new("hello")
+    result = sv.gsub(/./, &:upcase)
+    assert_equal("HELLO", result)
+  end
+
+  # ---------------------------------------------------------------------------
+  # to_str implicit coercion (private method)
+  # ---------------------------------------------------------------------------
+
+  def test_to_str_enables_regexp_match
+    sv = StringView.new("hello world")
+    # Regexp#=~ calls to_str internally for coercion
+    assert_equal(0, /hello/ =~ sv)
+  end
+
+  def test_to_str_enables_string_interpolation
+    sv = StringView.new("world")
+    result = "hello #{sv}"
+    assert_equal("hello world", result)
+  end
+
+  def test_to_str_enables_string_concatenation_rhs
+    sv = StringView.new("world")
+    result = "hello " + sv
+    assert_equal("hello world", result)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tier 2: Additional slicing edge cases
+  # ---------------------------------------------------------------------------
+
+  def test_byteslice_single_integer
+    sv = StringView.new("hello")
+    result = sv.byteslice(1)
+    assert_instance_of(StringView, result)
+    assert_equal("e", result.to_s)
+  end
+
+  def test_byteslice_negative_offset
+    sv = StringView.new("hello")
+    result = sv.byteslice(-2, 2)
+    assert_instance_of(StringView, result)
+    assert_equal("lo", result.to_s)
+  end
+
+  def test_byteslice_negative_single
+    sv = StringView.new("hello")
+    result = sv.byteslice(-1)
+    assert_instance_of(StringView, result)
+    assert_equal("o", result.to_s)
+  end
+
+  def test_byteslice_out_of_range
+    sv = StringView.new("hello")
+    assert_nil(sv.byteslice(10))
+    assert_nil(sv.byteslice(0, -1))
+  end
+
+  def test_aref_negative_range
+    sv = StringView.new("hello world")
+    result = sv[-5..-1]
+    assert_instance_of(StringView, result)
+    assert_equal("world", result.to_s)
+  end
+
+  def test_aref_negative_range_exclusive
+    sv = StringView.new("hello world")
+    result = sv[-5...-1]
+    assert_instance_of(StringView, result)
+    assert_equal("worl", result.to_s)
+  end
+
+  def test_aref_beginless_range
+    sv = StringView.new("hello")
+    result = sv[..2]
+    assert_instance_of(StringView, result)
+    assert_equal("hel", result.to_s)
+  end
+
+  def test_aref_endless_range
+    sv = StringView.new("hello")
+    result = sv[3..]
+    assert_instance_of(StringView, result)
+    assert_equal("lo", result.to_s)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Binary (ASCII-8BIT) encoding
+  # ---------------------------------------------------------------------------
+
+  def test_binary_encoding
+    str = "\x00\x01\x02\xFF\xFE".b
+    sv = StringView.new(str)
+    assert_equal(Encoding::ASCII_8BIT, sv.encoding)
+  end
+
+  def test_binary_bytesize
+    str = "\x00\x01\x02\xFF\xFE".b
+    sv = StringView.new(str)
+    assert_equal(5, sv.bytesize)
+  end
+
+  def test_binary_length_equals_bytesize
+    str = "\x00\x01\x02\xFF\xFE".b
+    sv = StringView.new(str)
+    # For binary encoding, char == byte
+    assert_equal(sv.bytesize, sv.length)
+  end
+
+  def test_binary_getbyte
+    str = "\x00\x01\xFF".b
+    sv = StringView.new(str)
+    assert_equal(0, sv.getbyte(0))
+    assert_equal(1, sv.getbyte(1))
+    assert_equal(255, sv.getbyte(2))
+  end
+
+  def test_binary_slice
+    str = "\x00\x01\x02\x03\x04\x05".b
+    sv = StringView.new(str)
+    result = sv[2, 3]
+    assert_instance_of(StringView, result)
+    assert_equal("\x02\x03\x04".b, result.to_s)
+  end
+
+  def test_binary_include
+    str = "\x00\x01\x02\xFF\xFE".b
+    sv = StringView.new(str)
+    assert_includes(sv, "\xFF".b)
+    refute_includes(sv, "\xAA".b)
+  end
+
+  def test_binary_each_byte
+    str = "\x00\xFF".b
+    sv = StringView.new(str)
+    bytes = []
+    sv.each_byte { |b| bytes << b }
+    assert_equal([0, 255], bytes)
+  end
+
+  # ---------------------------------------------------------------------------
+  # UTF-8 multibyte slicing at various offsets
+  # ---------------------------------------------------------------------------
+
+  def test_utf8_slice_at_start
+    sv = StringView.new("日本語テスト")
+    result = sv[0, 2]
+    assert_instance_of(StringView, result)
+    assert_equal("日本", result.to_s)
+  end
+
+  def test_utf8_slice_at_middle
+    sv = StringView.new("日本語テスト")
+    result = sv[2, 2]
+    assert_instance_of(StringView, result)
+    assert_equal("語テ", result.to_s)
+  end
+
+  def test_utf8_slice_at_end
+    sv = StringView.new("日本語テスト")
+    result = sv[4, 2]
+    assert_instance_of(StringView, result)
+    assert_equal("スト", result.to_s)
+  end
+
+  def test_utf8_slice_single_char
+    sv = StringView.new("日本語")
+    result = sv[1]
+    assert_instance_of(StringView, result)
+    assert_equal("本", result.to_s)
+  end
+
+  def test_utf8_slice_with_emoji
+    sv = StringView.new("hello 🎉 world")
+    result = sv[6, 1]
+    assert_instance_of(StringView, result)
+    assert_equal("🎉", result.to_s)
+  end
+
+  def test_utf8_slice_mixed_width
+    sv = StringView.new("aé日🎉b")
+    assert_equal(5, sv.length)
+    assert_equal("a", sv[0].to_s)
+    assert_equal("é", sv[1].to_s)
+    assert_equal("日", sv[2].to_s)
+    assert_equal("🎉", sv[3].to_s)
+    assert_equal("b", sv[4].to_s)
+  end
+
+  def test_utf8_negative_index
+    sv = StringView.new("日本語")
+    result = sv[-1]
+    assert_instance_of(StringView, result)
+    assert_equal("語", result.to_s)
+  end
+
+  def test_utf8_range_slice
+    sv = StringView.new("日本語テスト")
+    result = sv[1..3]
+    assert_instance_of(StringView, result)
+    assert_equal("本語テ", result.to_s)
+  end
+
+  def test_utf8_chained_slicing
+    sv = StringView.new("日本語テスト")
+    s1 = sv[1, 4]       # "本語テス"
+    s2 = s1[1, 2]       # "語テ"
+    assert_equal("語テ", s2.to_s)
+  end
+
+  def test_utf8_length_on_slice
+    sv = StringView.new("日本語テスト")
+    s = sv[2, 3]
+    assert_equal(3, s.length)
+    assert_equal(9, s.bytesize) # 3 CJK chars × 3 bytes each
+  end
+
+  # ---------------------------------------------------------------------------
+  # reset! cache invalidation
+  # ---------------------------------------------------------------------------
+
+  def test_reset_invalidates_charlen_cache
+    sv = StringView.new("hello")
+    assert_equal(5, sv.length) # caches charlen = 5
+
+    sv.reset!("日本語", 0, 9) # 3 chars, 9 bytes
+    assert_equal(3, sv.length) # must recompute, not return cached 5
+  end
+
+  def test_reset_invalidates_charlen_multibyte_to_ascii
+    sv = StringView.new("日本語")
+    assert_equal(3, sv.length) # caches charlen = 3
+
+    sv.reset!("hello world", 0, 11) # 11 chars
+    assert_equal(11, sv.length) # must recompute
+  end
+
+  def test_reset_slicing_uses_new_content
+    sv = StringView.new("aaaa")
+    sv[0, 2] # may build stride index
+
+    sv.reset!("日本語テスト", 0, 18)
+    result = sv[2, 2]
+    assert_equal("語テ", result.to_s)
+  end
+
+  def test_frozen_after_reset
+    sv = StringView.new("hello")
+    sv.reset!("world", 0, 5)
+    assert_predicate(sv, :frozen?)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Iteration edge cases
+  # ---------------------------------------------------------------------------
+
+  def test_each_char_on_slice
+    sv = StringView.new("hello world", 6, 5)
+    chars = []
+    sv.each_char { |c| chars << c }
+    assert_equal(["w", "o", "r", "l", "d"], chars)
+  end
+
+  def test_each_byte_multibyte
+    sv = StringView.new("é") # 2 bytes: 0xC3 0xA9
+    bytes = []
+    sv.each_byte { |b| bytes << b }
+    assert_equal([0xC3, 0xA9], bytes)
+  end
+
+  def test_bytes_on_slice
+    sv = StringView.new("hello", 1, 3)
+    assert_equal([101, 108, 108], sv.bytes) # "ell"
+  end
+
+  def test_chars_on_slice
+    # "café" is 5 bytes (c=1, a=1, f=1, é=2), use character-based slicing
+    sv = StringView.new("café latte")
+    s = sv[0, 4] # character-based: "café"
+    assert_equal(["c", "a", "f", "é"], s.chars)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Comparable and equality edge cases
+  # ---------------------------------------------------------------------------
+
+  def test_comparable_with_string
+    sv = StringView.new("abc")
+    assert_operator(sv, :<, "def")
+    assert_operator(sv, :>, "aaa")
+  end
+
+  def test_eq_two_slices_different_backings
+    sv1 = StringView.new("hello world")[0, 5]
+    sv2 = StringView.new("hello there")[0, 5]
+    assert_equal(sv1, sv2) # both "hello"
+  end
+
+  def test_eq_slice_vs_full
+    sv1 = StringView.new("hello")
+    sv2 = StringView.new("say hello")[4, 5]
+    assert_equal(sv1, sv2)
+  end
+
+  def test_hash_on_slices
+    sv1 = StringView.new("hello world")[0, 5]
+    sv2 = StringView.new("hello there")[0, 5]
+    assert_equal(sv1.hash, sv2.hash)
+  end
+
+  def test_hash_on_slice_equals_full
+    sv1 = StringView.new("hello")
+    sv2 = StringView.new("say hello")[4, 5]
+    assert_equal(sv1.hash, sv2.hash)
+  end
+
+  def test_usable_as_hash_key_with_slices
+    h = {}
+    sv1 = StringView.new("hello world")[0, 5]
+    sv2 = StringView.new("hello there")[0, 5]
+    h[sv1] = :found
+    assert_equal(:found, h[sv2])
+  end
+
+  def test_cmp_with_nil
+    sv = StringView.new("hello")
+    assert_nil(sv <=> nil)
+  end
+
+  def test_cmp_with_integer
+    sv = StringView.new("hello")
+    assert_nil(sv <=> 42)
+  end
+
+  # ---------------------------------------------------------------------------
   # GC safety — strong marks keep the backing alive
   # ---------------------------------------------------------------------------
 
