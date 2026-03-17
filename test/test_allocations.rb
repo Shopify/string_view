@@ -2,7 +2,6 @@
 
 require "test_helper"
 
-#
 # Tests that verify the allocation behavior of StringView operations.
 # These ensure that Tier 1 (zero-copy) operations don't allocate,
 # Tier 2 (slicing) allocates exactly one StringView, and Tier 3
