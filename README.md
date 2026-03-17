@@ -49,16 +49,24 @@ StringView methods are organized into three tiers based on their allocation beha
 
 StringView's primary advantage is **inner slicing** — extracting a substring from the middle of a large string. CRuby's `String#[]` must copy the bytes (except for tail slices), while StringView just adjusts an offset and length.
 
-**Inner slice creation** (YJIT, 1MB ASCII backing):
+**Inner slice creation** (Ruby 4.0.2, YJIT, 1MB ASCII backing):
 
 | Slice size | String | StringView | Speedup |
 |------------|--------|------------|---------|
-| 1 KB | 6.9M i/s | 19.3M i/s | **2.8x faster** |
-| 10 KB | 1.7M i/s | 19.1M i/s | **11x faster** |
-| 100 KB | 570K i/s | 19.5M i/s | **34x faster** |
-| 500 KB | 133K i/s | 19.5M i/s | **146x faster** |
+| 1 KB | 5.98M i/s | 22.4M i/s | **3.75x faster** |
+| 10 KB | 1.74M i/s | 21.2M i/s | **12.2x faster** |
+| 100 KB | 555K i/s | 21.5M i/s | **38.8x faster** |
+| 500 KB | 131K i/s | 21.6M i/s | **165x faster** |
 
-StringView slice creation is **constant time** regardless of slice size, while String scales linearly with the number of bytes copied.
+StringView slice creation is **constant time** (~45ns) regardless of slice size, while String scales linearly with the number of bytes copied.
+
+**Combined: inner slice then operate** (the real-world pattern):
+
+| Operation | String | StringView | Speedup |
+|-----------|--------|------------|---------|
+| slice + `start_with?` | 126K i/s | 18.9M i/s | **151x faster** |
+| slice + `include?` (500KB) | 6.97K i/s | 7.37K i/s | 1.06x faster |
+| 50 inner slices | 60.1K i/s | 396K i/s | **6.6x faster** |
 
 **UTF-8 character-indexed slicing** (YJIT, 1.2M-char / 2.8MB UTF-8 string, stride index pre-built):
 
@@ -79,26 +87,26 @@ StringView builds a stride index on first character-indexed access, making subse
 
 **Memory** (1,000 inner slices of 10KB each from a 1MB string):
 - String: **10 MB** (each slice copies its bytes)
-- StringView: **128 KB** (each slice is a small struct)
-- **78x less memory**
+- StringView: **224 KB** (each slice is a small embedded struct)
+- **45x less memory**
 
 **Reads on pre-existing slices:**
 
 | Operation | String | StringView | Ratio |
 |-----------|--------|------------|-------|
-| `start_with?` | 37M i/s | 47M i/s | **1.26x faster** |
-| `include?` (500KB) | 7.1K i/s | 7.4K i/s | same |
+| `start_with?` | 40.0M i/s | 48.9M i/s | **1.22x faster** |
+| `include?` (500KB) | 7.2K i/s | 7.2K i/s | same |
 
 ### Where String is faster
 
-For simple accessor methods on pre-existing objects, String has a ~10% advantage because its internal macros (`RSTRING_LEN`, etc.) are inlined by the compiler, while StringView goes through the TypedData API:
+For simple accessor methods on pre-existing objects, String has a small advantage because its internal macros (`RSTRING_LEN`, etc.) are inlined by the compiler, while StringView goes through the TypedData API:
 
 | Operation | String | StringView | Overhead |
 |-----------|--------|------------|----------|
-| `bytesize` | 59M i/s | 54M i/s | 1.10x slower |
-| `getbyte` | 59M i/s | 54M i/s | 1.10x slower |
+| `bytesize` | 67.4M i/s | 60.7M i/s | 1.11x slower |
+| `getbyte` | 62.2M i/s | 57.3M i/s | same-ish (within error) |
 
-This is the irreducible cost of being a C extension type rather than a built-in.
+This is the irreducible cost of being a C extension type rather than a built-in. In practice, the difference is ~5ns per call.
 
 **Tail slices** (slices that extend to the end of the string) are already zero-copy in CRuby via shared strings, so StringView provides no advantage there.
 
