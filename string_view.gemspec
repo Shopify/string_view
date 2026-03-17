@@ -5,8 +5,8 @@ require_relative "lib/string_view/version"
 Gem::Specification.new do |spec|
   spec.name = "string_view"
   spec.version = StringView::VERSION
-  spec.authors = ["Ufuk Kayserilioglu"]
-  spec.email = ["ufuk@paralaus.com"]
+  spec.authors = ["Shopify"]
+  spec.email = ["ruby@shopify.com"]
 
   spec.summary = "Zero-copy string slicing for Ruby via a C extension."
   spec.description = "StringView provides a read-only, zero-copy view into a frozen " \
@@ -14,7 +14,7 @@ Gem::Specification.new do |spec|
                      "searching, and delegation of transform methods."
   spec.homepage = "https://github.com/Shopify/string_view"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.2.0"
+  spec.required_ruby_version = ">= 3.3.0"
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/Shopify/string_view"
 

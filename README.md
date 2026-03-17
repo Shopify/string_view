@@ -135,7 +135,7 @@ Or install directly:
 gem install string_view
 ```
 
-The gem includes a C extension that compiles during installation. It requires Ruby 3.2+ and a C99/C++17 compiler.
+The gem includes a C extension that compiles during installation. It requires Ruby 3.3+ and a C99/C++17 compiler. Ruby 3.3 is needed for `RUBY_TYPED_EMBEDDABLE` (struct embedding in the Ruby object) and `RTYPEDDATA_GET_DATA` (fast struct access).
 
 ## Usage
 
