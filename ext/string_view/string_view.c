@@ -16,9 +16,11 @@
 /* ========================================================================= */
 
 typedef struct {
-    VALUE  backing; /* frozen String that owns the bytes */
-    long   offset;  /* byte offset into backing */
-    long   length;  /* byte length of this view */
+    VALUE  backing;     /* frozen String that owns the bytes */
+    const char *base;   /* cached RSTRING_PTR(backing) — avoids indirection */
+    rb_encoding *enc;   /* cached encoding — avoids rb_enc_get per call */
+    long   offset;      /* byte offset into backing */
+    long   length;      /* byte length of this view */
 } string_view_t;
 
 static VALUE cStringView;
@@ -46,6 +48,7 @@ static void sv_compact(void *ptr) {
     string_view_t *sv = (string_view_t *)ptr;
     if (sv->backing != Qnil) {
         sv->backing = rb_gc_location(sv->backing);
+        sv->base = RSTRING_PTR(sv->backing);
     }
 }
 
@@ -76,12 +79,12 @@ SV_INLINE string_view_t *sv_get_struct(VALUE self) {
 
 /* Pointer to the start of this view's bytes */
 SV_INLINE const char *sv_ptr(string_view_t *sv) {
-    return RSTRING_PTR(sv->backing) + sv->offset;
+    return sv->base + sv->offset;
 }
 
 /* encoding of the backing string */
 SV_INLINE rb_encoding *sv_enc(string_view_t *sv) {
-    return rb_enc_get(sv->backing);
+    return sv->enc;
 }
 
 /*
@@ -100,6 +103,8 @@ SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
                                      &string_view_type, sv);
     RB_OBJ_WRITE(obj, &sv->backing, backing);
+    sv->base    = RSTRING_PTR(backing);
+    sv->enc     = rb_enc_get(backing);
     sv->offset  = offset;
     sv->length  = length;
     FL_SET_RAW(obj, FL_FREEZE);
@@ -115,6 +120,8 @@ static VALUE sv_alloc(VALUE klass) {
     VALUE obj = TypedData_Make_Struct(klass, string_view_t,
                                      &string_view_type, sv);
     sv->backing = Qnil;
+    sv->base    = NULL;
+    sv->enc     = NULL;
     sv->offset  = 0;
     sv->length  = 0;
     return obj;
@@ -156,6 +163,8 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
 
     string_view_t *sv = sv_get_struct(self);
     RB_OBJ_WRITE(self, &sv->backing, str);
+    sv->base    = RSTRING_PTR(str);
+    sv->enc     = rb_enc_get(str);
     sv->offset  = offset;
     sv->length  = length;
 
@@ -209,6 +218,8 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     }
 
     RB_OBJ_WRITE(self, &sv->backing, new_backing);
+    sv->base   = RSTRING_PTR(new_backing);
+    sv->enc    = rb_enc_get(new_backing);
     sv->offset = off;
     sv->length = len;
 
