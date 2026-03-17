@@ -2,6 +2,6 @@
 
 require "mkmf"
 
-$CFLAGS << " -std=c99 -Wall -Wextra -Wno-unused-parameter"
+$CFLAGS << " -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter"
 
 create_makefile("string_view/string_view")

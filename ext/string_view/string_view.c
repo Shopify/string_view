@@ -695,9 +695,13 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
     VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
-    rb_scan_args(argc, argv, "11", &arg1, &arg2);
+    if (SV_UNLIKELY(argc < 1 || argc > 2)) {
+        rb_error_arity(argc, 1, 2);
+    }
+    arg1 = argv[0];
+    arg2 = (argc == 2) ? argv[1] : Qnil;
 
-    if (!NIL_P(arg2)) {
+    if (argc == 2) {
         long off = NUM2LONG(arg1);
         long len = NUM2LONG(arg2);
 
