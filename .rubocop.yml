@@ -9,3 +9,7 @@ plugins:
 AllCops:
   NewCops: disable
   SuggestExtensions: false
+
+Style/GlobalVars:
+  Exclude:
+    - ext/string_view/extconf.rb
