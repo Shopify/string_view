@@ -16,6 +16,18 @@
 /* Struct & TypedData                                                        */
 /* ========================================================================= */
 
+/*
+ * Stride index: maps every STRIDE_CHARS-th character to its byte offset.
+ * Built lazily on first char-indexed access. Enables O(1) char→byte
+ * lookup for any offset (small scalar scan within one stride).
+ */
+#define STRIDE_CHARS 128
+
+typedef struct {
+    long *offsets;   /* offsets[i] = byte offset of character i*STRIDE_CHARS */
+    long  count;     /* number of entries = ceil(charlen / STRIDE_CHARS) + 1 */
+} stride_index_t;
+
 typedef struct {
     VALUE  backing;     /* frozen String that owns the bytes */
     const char *base;   /* cached RSTRING_PTR(backing) — avoids indirection */
@@ -24,6 +36,7 @@ typedef struct {
     long   length;      /* byte length of this view */
     long   charlen;     /* cached character count; -1 = not yet computed */
     int    single_byte; /* cached: 1 if char==byte (ASCII/single-byte enc), 0 if multibyte, -1 unknown */
+    stride_index_t *stride_idx; /* lazily built stride index for multibyte, NULL if not built */
 } string_view_t;
 
 static VALUE cStringView;
@@ -55,13 +68,26 @@ static void sv_compact(void *ptr) {
     }
 }
 
+static void sv_free(void *ptr) {
+    string_view_t *sv = (string_view_t *)ptr;
+    if (sv->stride_idx) {
+        xfree(sv->stride_idx->offsets);
+        xfree(sv->stride_idx);
+    }
+}
+
 static size_t sv_memsize(const void *ptr) {
-    return sizeof(string_view_t);
+    const string_view_t *sv = (const string_view_t *)ptr;
+    size_t size = sizeof(string_view_t);
+    if (sv->stride_idx) {
+        size += sizeof(stride_index_t) + sv->stride_idx->count * sizeof(long);
+    }
+    return size;
 }
 
 static const rb_data_type_t string_view_type = {
     "StringView",
-    { sv_mark, RUBY_TYPED_DEFAULT_FREE, sv_memsize, sv_compact },
+    { sv_mark, sv_free, sv_memsize, sv_compact },
     0, 0,
     RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE
 };
@@ -109,6 +135,7 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     sv->length      = length;
     sv->single_byte = parent->single_byte;
     sv->charlen     = -1;
+    sv->stride_idx  = NULL;
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -126,6 +153,7 @@ SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     sv->length      = length;
     sv->single_byte = sv_compute_single_byte(backing, enc);
     sv->charlen     = -1;
+    sv->stride_idx  = NULL;
     FL_SET_RAW(obj, FL_FREEZE);
     return obj;
 }
@@ -145,6 +173,7 @@ static VALUE sv_alloc(VALUE klass) {
     sv->length      = 0;
     sv->single_byte = -1;
     sv->charlen     = -1;
+    sv->stride_idx  = NULL;
     return obj;
 }
 
@@ -191,6 +220,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     sv->length      = length;
     sv->single_byte = sv_compute_single_byte(str, enc);
     sv->charlen     = -1;
+    sv->stride_idx  = NULL;
 
     rb_obj_freeze(self);
 
@@ -249,6 +279,7 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv->length      = len;
     sv->single_byte = sv_compute_single_byte(new_backing, enc);
     sv->charlen     = -1;
+    sv->stride_idx  = NULL;
 
     return self;
 }
@@ -618,52 +649,81 @@ static const unsigned char utf8_char_len[256] = {
 };
 
 /*
+ * Build the stride index for a UTF-8 view. Maps every STRIDE_CHARS-th
+ * character to its byte offset using simdutf SIMD counting for bulk
+ * char→byte conversion. Built lazily on first char-indexed access.
+ *
+ * After building: offsets[i] = byte offset of character (i * STRIDE_CHARS).
+ * To find char N: look up offsets[N / STRIDE_CHARS], then scalar-scan
+ * at most STRIDE_CHARS characters. This is O(1) for any offset.
+ */
+static void sv_build_stride_index(string_view_t *sv) {
+    if (sv->stride_idx) return; /* already built */
+
+    long total_chars = sv_char_count(sv); /* ensures charlen is cached */
+    long n_entries = total_chars / STRIDE_CHARS + 1;
+
+    stride_index_t *idx = (stride_index_t *)xmalloc(sizeof(stride_index_t));
+    idx->offsets = (long *)xmalloc(n_entries * sizeof(long));
+    idx->count = n_entries;
+
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+    const unsigned char *e = p + sv->length;
+    long entry = 0;
+    long byte_pos = 0;
+
+    idx->offsets[entry++] = 0; /* char 0 is at byte 0 */
+
+    /* Walk the string, recording byte offset every STRIDE_CHARS characters */
+    const unsigned char *s = p;
+    long char_pos = 0;
+
+    while (s < e && entry < n_entries) {
+        /* Advance STRIDE_CHARS characters */
+        long remaining = STRIDE_CHARS;
+        while (s < e && remaining > 0) {
+            s += utf8_char_len[*s];
+            remaining--;
+        }
+        char_pos += STRIDE_CHARS - remaining;
+        idx->offsets[entry++] = (long)(s - p);
+    }
+
+    sv->stride_idx = idx;
+}
+
+/*
  * Find the byte offset of the char_idx-th character in a UTF-8 string.
  *
- * Uses SIMD-accelerated binary search: repeatedly halve the byte range
- * and use simdutf_count_utf8 (NEON/SSE/AVX) to count characters in each
- * half. This gives O(log n) SIMD passes instead of O(n) scalar scan.
- *
- * Once the range is small enough (< 64 bytes), fall back to scalar
- * lookup table scan for the final characters.
+ * Uses the stride index for O(1) lookup: jump to the nearest stride
+ * boundary, then scalar-scan at most STRIDE_CHARS characters.
  */
-static long sv_utf8_char_to_byte_offset(const char *p, long len, long char_idx) {
+static long sv_utf8_char_to_byte_offset_indexed(string_view_t *sv, long char_idx) {
     if (char_idx == 0) return 0;
 
-    /* Binary search: narrow byte range using SIMD char counting */
-    long lo = 0, hi = len;
-    long chars_before_lo = 0;  /* characters in p[0..lo) */
-    long target = char_idx;
+    sv_build_stride_index(sv);
 
-    while (hi - lo >= 64) {
-        long mid = lo + (hi - lo) / 2;
-        /* Ensure mid lands on a character boundary (not a continuation byte) */
-        while (mid < hi && ((unsigned char)p[mid] & 0xC0) == 0x80) mid++;
-        if (mid >= hi) break;
+    stride_index_t *idx = sv->stride_idx;
+    long slot = char_idx / STRIDE_CHARS;
+    long remainder = char_idx % STRIDE_CHARS;
 
-        long chars_in_range = (long)simdutf_count_utf8(p + lo, mid - lo);
-        if (chars_before_lo + chars_in_range < target) {
-            /* Target is in the right half */
-            chars_before_lo += chars_in_range;
-            lo = mid;
-        } else {
-            /* Target is in the left half */
-            hi = mid;
-        }
-    }
+    if (slot >= idx->count) return -1;
 
-    /* Scalar scan for the remaining small range */
-    const unsigned char *s = (const unsigned char *)p + lo;
-    const unsigned char *e = (const unsigned char *)p + hi;
-    long remaining = target - chars_before_lo;
+    long byte_off = idx->offsets[slot];
 
-    while (s < e && remaining > 0) {
+    if (remainder == 0) return byte_off;
+
+    /* Scalar scan for the remaining characters within one stride */
+    const unsigned char *s = (const unsigned char *)sv_ptr(sv) + byte_off;
+    const unsigned char *e = (const unsigned char *)sv_ptr(sv) + sv->length;
+
+    while (s < e && remainder > 0) {
         s += utf8_char_len[*s];
-        remaining--;
+        remainder--;
     }
 
-    if (remaining > 0) return -1;
-    return (long)(s - (const unsigned char *)p);
+    if (remainder > 0) return -1;
+    return (long)(s - (const unsigned char *)sv_ptr(sv));
 }
 
 /*
@@ -692,7 +752,7 @@ static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
     }
 
     if (SV_LIKELY(sv_is_utf8(sv))) {
-        return sv_utf8_char_to_byte_offset(sv_ptr(sv), sv->length, char_idx);
+        return sv_utf8_char_to_byte_offset_indexed(sv, char_idx);
     }
 
     rb_encoding *enc = sv_enc(sv);
