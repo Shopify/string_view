@@ -845,11 +845,16 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
             if (idx < 0) return Qnil;
         }
 
-        /* Use SIMD-accelerated char_to_byte for UTF-8, generic for others */
+        /* Two O(1) stride lookups for start and end byte offsets */
         long byte_off = sv_char_to_byte_offset(sv, idx);
         if (byte_off < 0) return Qnil;
 
-        long byte_len = sv_chars_to_bytes(sv, byte_off, len);
+        /* Clamp len to remaining characters */
+        long total_chars = sv_char_count(sv);
+        if (idx + len > total_chars) len = total_chars - idx;
+
+        long byte_end = sv_char_to_byte_offset(sv, idx + len);
+        long byte_len = byte_end - byte_off;
 
         return sv_new_from_parent(sv,
                                    sv->offset + byte_off,
