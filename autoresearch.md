@@ -50,6 +50,16 @@ the GC. Key hot paths:
    index, rindex, match, to_i, and all Tier 3 methods. Each call allocates one String.
 
 ## What's Been Tried
-- **Baseline**: Current state after removing `sv_backing_or_raise`. Accessor methods are
-  ~1.5-2.2x slower than String due to TypedData overhead. Inner slicing is 13-62x faster
-  than String (zero-copy vs. memcpy).
+- **Baseline** (composite ~6.08M): Accessor methods ~1.5-2.2x slower than String due to
+  TypedData overhead. Inner slicing 13-62x faster than String.
+- **Inline hints + FL_SET_RAW freeze + RUBY_TYPED_FROZEN_SHAREABLE** (composite ~6.36M, +4.6%):
+  `__attribute__((always_inline))` on hot helpers, `FL_SET_RAW(obj, FL_FREEZE)` instead of
+  `rb_obj_freeze`, `SV_LIKELY`/`SV_UNLIKELY` branch hints. Marginal alone — needs -O3 to matter.
+- **-O3 + skip rb_scan_args in aref/byteslice** (composite ~9.97M, +57%):
+  The -O3 flag was the big win — it let the compiler actually inline the always_inline helpers.
+  Direct argv access instead of rb_scan_args removed overhead in the common `sv[i, len]` path.
+  After this: bytesize=parity, getbyte=parity, start_with?=1.11x FASTER than String.
+- **Cache base pointer + encoding in struct** (composite ~10.4M, +4.8%):
+  Store `RSTRING_PTR(backing)` and `rb_enc_get(backing)` at construction time. `sv_ptr()` and
+  `sv_enc()` now read cached fields. `sv_compact` updates base when GC moves backing.
+  Slicing 500KB now 83x faster than String.

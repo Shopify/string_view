@@ -454,15 +454,17 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
 
-    if (rb_obj_is_kind_of(other, cStringView)) {
+    /* Fast path: String is the most common comparison target */
+    if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
+        if (sv->length != RSTRING_LEN(other)) return Qfalse;
+        return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
+    }
+
+    /* Check for StringView via class pointer (faster than rb_obj_is_kind_of) */
+    if (rb_obj_class(other) == cStringView) {
         string_view_t *o = sv_get_struct(other);
         if (sv->length != o->length) return Qfalse;
         return memcmp(p, sv_ptr(o), sv->length) == 0 ? Qtrue : Qfalse;
-    }
-
-    if (RB_TYPE_P(other, T_STRING)) {
-        if (sv->length != RSTRING_LEN(other)) return Qfalse;
-        return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
     return Qfalse;
@@ -474,13 +476,13 @@ static VALUE sv_cmp(VALUE self, VALUE other) {
     const char *op;
     long olen;
 
-    if (rb_obj_is_kind_of(other, cStringView)) {
+    if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
+        op = RSTRING_PTR(other);
+        olen = RSTRING_LEN(other);
+    } else if (rb_obj_class(other) == cStringView) {
         string_view_t *o = sv_get_struct(other);
         op = sv_ptr(o);
         olen = o->length;
-    } else if (RB_TYPE_P(other, T_STRING)) {
-        op = RSTRING_PTR(other);
-        olen = RSTRING_LEN(other);
     } else {
         return Qnil;
     }
@@ -497,7 +499,7 @@ static VALUE sv_cmp(VALUE self, VALUE other) {
 }
 
 static VALUE sv_eql_p(VALUE self, VALUE other) {
-    if (!rb_obj_is_kind_of(other, cStringView)) return Qfalse;
+    if (rb_obj_class(other) != cStringView) return Qfalse;
     return sv_eq(self, other);
 }
 
