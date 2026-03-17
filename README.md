@@ -255,6 +255,10 @@ The gem is available as open source under the terms of the [MIT License](https:/
 
 simdutf is included under the [MIT License](https://github.com/simdutf/simdutf/blob/master/LICENSE-MIT) (also available under Apache 2.0). See [LICENSE-simdutf.txt](LICENSE-simdutf.txt) for the full text.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to contribute.
+
 ## Code of Conduct
 
-Everyone interacting in the StringView project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [code of conduct](https://github.com/Shopify/string_view/blob/main/CODE_OF_CONDUCT.md).
+Everyone interacting in the StringView project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [Contributor Code of Conduct](CODE_OF_CONDUCT.md). Report unacceptable behavior to <opensource@shopify.com>.
