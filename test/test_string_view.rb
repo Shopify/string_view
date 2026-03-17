@@ -752,7 +752,8 @@ class TestStringView < Minitest::Test
 
   def test_count
     sv = StringView.new("hello world")
-    assert_equal 3, sv.count("lo")
+    # String#count counts individual character occurrences: l=3, o=2 = 5
+    assert_equal 5, sv.count("lo")
   end
 
   def test_delete
