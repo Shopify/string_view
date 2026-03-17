@@ -1,15 +1,7 @@
 #include "ruby.h"
-#include "ruby/version.h"
 #include "ruby/encoding.h"
 #include "ruby/re.h"
 #include "simdutf_c.h"
-
-/* Ruby 3.4+ added an encoding parameter to rb_memsearch */
-#if (RUBY_API_VERSION_MAJOR > 3) || (RUBY_API_VERSION_MAJOR == 3 && RUBY_API_VERSION_MINOR >= 4)
-#define SV_MEMSEARCH(xs, xl, ys, yl, enc) rb_memsearch((xs), (xl), (ys), (yl), (enc))
-#else
-#define SV_MEMSEARCH(xs, xl, ys, yl, enc) rb_memsearch((xs), (xl), (ys), (yl))
-#endif
 
 #define SV_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define SV_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -334,7 +326,7 @@ static VALUE sv_include_p(VALUE self, VALUE substr) {
     if (slen == 0) return Qtrue;
     if (slen > sv->length) return Qfalse;
 
-    long pos = SV_MEMSEARCH(RSTRING_PTR(substr), slen, p, sv->length, sv_enc(sv));
+    long pos = rb_memsearch(RSTRING_PTR(substr), slen, p, sv->length, sv_enc(sv));
     return pos >= 0 && pos <= sv->length - slen ? Qtrue : Qfalse;
 }
 
@@ -976,7 +968,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         }
         if (slen > sv->length) return Qnil;
 
-        long pos = SV_MEMSEARCH(RSTRING_PTR(arg1), slen, p, sv->length, sv_enc(sv));
+        long pos = rb_memsearch(RSTRING_PTR(arg1), slen, p, sv->length, sv_enc(sv));
         if (pos < 0 || pos > sv->length - slen) return Qnil;
 
         return sv_new_from_parent(sv, sv->offset + pos, slen);
