@@ -2,7 +2,7 @@
 
 A zero-copy, read-only view into a Ruby String, implemented as a C extension. StringView avoids allocating and copying bytes when slicing strings, making it significantly faster and more memory-efficient than `String#[]` for inner slices — especially on large buffers.
 
-Think of it like C++'s `std::string_view` or Rust's `&str`: a non-owning window into an existing string's bytes.
+Think of it like C++'s `std::string_view` or Rust's `&str`: a lightweight window into an existing string's bytes.
 
 ## How it works
 
@@ -37,9 +37,9 @@ StringView methods are organized into three tiers based on their allocation beha
 **Tier 3 — Transform via delegation** (one String for the result, no intermediate copy):
 `upcase`, `downcase`, `capitalize`, `swapcase`, `strip`, `lstrip`, `rstrip`, `chomp`, `chop`, `reverse`, `squeeze`, `encode`, `gsub`, `sub`, `tr`, `split`, `scan`, `count`, `delete`, `center`, `ljust`, `rjust`, `%`, `+`, `*`, `unpack1`, `scrub`, `unicode_normalize`
 
-### What's intentionally missing
+### Design decisions
 
-- **`to_str` is not defined.** StringView will never be implicitly coerced into a String. This prevents silent copies in places like `String#+`, `IO#write`, or `Kernel#puts`. Call `.to_s` explicitly when you need a real String.
+- **`to_str` is private.** Ruby's internal coercion protocol (`rb_check_string_type`) ignores method visibility, so StringView works seamlessly with `Regexp#=~`, string interpolation, and `String#+`. But `respond_to?(:to_str)` returns `false`, so code that explicitly checks for string-like objects won't treat StringView as a drop-in String replacement. When coercion happens, it returns a frozen shared string (zero-copy for heap-allocated backings).
 - **All bang methods raise `FrozenError`.** StringView is immutable — `upcase!`, `gsub!`, `slice!`, etc. all raise immediately.
 - **`method_missing` is a safety net.** Any String method not yet implemented natively raises `NotImplementedError` with a message telling you to call `.to_s.method_name(...)` explicitly. No silent fallback.
 
@@ -119,7 +119,6 @@ StringView is less beneficial when you:
 - Work with small strings (< 1KB) where copy cost is negligible
 - Only need tail slices (CRuby already optimizes these)
 - Primarily call simple accessors (`bytesize`, `getbyte`) on pre-existing slices
-- Need implicit String coercion (`to_str`) for interop with code that expects Strings
 
 ## Installation
 
@@ -231,13 +230,14 @@ The extension is compiled with `-O3` and uses `__attribute__((always_inline))` o
 git clone https://github.com/Shopify/string_view
 cd string_view
 bundle install
-rake compile
-rake test
+bundle exec rake compile
+bundle exec rake test
 ```
 
 Run benchmarks:
 
 ```bash
+bundle exec rake compile
 ruby --yjit -Ilib benchmark/bench.rb
 ```
 
