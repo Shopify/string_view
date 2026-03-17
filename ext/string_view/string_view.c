@@ -473,28 +473,88 @@ static VALUE sv_match_operator(VALUE self, VALUE pattern) {
 /* Tier 1: Numeric conversions                                               */
 /* ========================================================================= */
 
+/*
+ * Get a NUL-terminated C string from the view for numeric parsing.
+ * Uses a stack buffer for short strings (common case), heap for long ones.
+ * The caller must call sv_cstr_free() after use if heap was allocated.
+ */
+#define SV_CSTR_STACK_SIZE 128
+
+typedef struct {
+    char stack_buf[SV_CSTR_STACK_SIZE];
+    char *ptr;
+} sv_cstr_t;
+
+SV_INLINE void sv_cstr_init(sv_cstr_t *cs, string_view_t *sv) {
+    const char *p = sv_ptr(sv);
+    long len = sv->length;
+    if (SV_LIKELY(len < SV_CSTR_STACK_SIZE)) {
+        memcpy(cs->stack_buf, p, len);
+        cs->stack_buf[len] = '\0';
+        cs->ptr = cs->stack_buf;
+    } else {
+        cs->ptr = (char *)xmalloc(len + 1);
+        memcpy(cs->ptr, p, len);
+        cs->ptr[len] = '\0';
+    }
+}
+
+SV_INLINE void sv_cstr_free(sv_cstr_t *cs) {
+    if (cs->ptr != cs->stack_buf) {
+        xfree(cs->ptr);
+    }
+}
+
+/*
+ * to_i([base]) — parse integer directly from byte pointer, zero allocations.
+ * Uses rb_cstr_to_inum which parses from a NUL-terminated C string.
+ */
 static VALUE sv_to_i(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("to_i"), argc, argv);
+    int base = 10;
+    if (argc > 0) base = NUM2INT(argv[0]);
+
+    sv_cstr_t cs;
+    sv_cstr_init(&cs, sv);
+    VALUE result = rb_cstr_to_inum(cs.ptr, base, 0);
+    sv_cstr_free(&cs);
+    return result;
 }
 
+/*
+ * to_f — parse float directly from byte pointer, zero allocations.
+ */
 static VALUE sv_to_f(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcall(shared, rb_intern("to_f"), 0);
+    sv_cstr_t cs;
+    sv_cstr_init(&cs, sv);
+    double d = rb_cstr_to_dbl(cs.ptr, 0);
+    sv_cstr_free(&cs);
+    return DBL2NUM(d);
 }
 
+/*
+ * hex — parse hexadecimal integer directly.
+ */
 static VALUE sv_hex(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcall(shared, rb_intern("hex"), 0);
+    sv_cstr_t cs;
+    sv_cstr_init(&cs, sv);
+    VALUE result = rb_cstr_to_inum(cs.ptr, 16, 0);
+    sv_cstr_free(&cs);
+    return result;
 }
 
+/*
+ * oct — parse octal integer directly.
+ */
 static VALUE sv_oct(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcall(shared, rb_intern("oct"), 0);
+    sv_cstr_t cs;
+    sv_cstr_init(&cs, sv);
+    VALUE result = rb_cstr_to_inum(cs.ptr, 8, 0);
+    sv_cstr_free(&cs);
+    return result;
 }
 
 /* ========================================================================= */
