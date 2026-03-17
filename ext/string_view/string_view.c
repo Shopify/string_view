@@ -91,7 +91,21 @@ static VALUE sv_as_shared_str(string_view_t *sv) {
     return shared;
 }
 
-/* Allocate a new StringView VALUE pointing into the same backing */
+/* Allocate a new StringView from a parent that already has cached base/enc */
+SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long length) {
+    string_view_t *sv;
+    VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
+                                     &string_view_type, sv);
+    RB_OBJ_WRITE(obj, &sv->backing, parent->backing);
+    sv->base    = parent->base;
+    sv->enc     = parent->enc;
+    sv->offset  = offset;
+    sv->length  = length;
+    FL_SET_RAW(obj, FL_FREEZE);
+    return obj;
+}
+
+/* Allocate a new StringView VALUE pointing into a raw backing string */
 SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
     string_view_t *sv;
     VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
@@ -581,7 +595,6 @@ static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
 
 static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
     if (SV_UNLIKELY(argc < 1 || argc > 2)) {
@@ -600,7 +613,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
             if (idx < 0) idx += total;
             if (SV_UNLIKELY(idx < 0 || idx > total || len < 0)) return Qnil;
             if (idx + len > total) len = total - idx;
-            return sv_new_from_backing(backing,
+            return sv_new_from_parent(sv,
                                        sv->offset + idx,
                                        len);
         }
@@ -619,7 +632,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
 
-        return sv_new_from_backing(backing,
+        return sv_new_from_parent(sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -652,7 +665,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long byte_off = sv_char_to_byte_offset(sv, beg);
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
 
-        return sv_new_from_backing(backing,
+        return sv_new_from_parent(sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -668,7 +681,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long byte_off = sv_char_to_byte_offset(sv, match_beg);
         long byte_len = RSTRING_LEN(matched);
 
-        return sv_new_from_backing(backing,
+        return sv_new_from_parent(sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -677,14 +690,14 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         const char *p = sv_ptr(sv);
         long slen = RSTRING_LEN(arg1);
         if (slen == 0) {
-            return sv_new_from_backing(backing, sv->offset, 0);
+            return sv_new_from_parent(sv, sv->offset, 0);
         }
         if (slen > sv->length) return Qnil;
 
         long pos = rb_memsearch(RSTRING_PTR(arg1), slen, p, sv->length, sv_enc(sv));
         if (pos < 0 || pos > sv->length - slen) return Qnil;
 
-        return sv_new_from_backing(backing, sv->offset + pos, slen);
+        return sv_new_from_parent(sv, sv->offset + pos, slen);
     }
 
     if (RB_INTEGER_TYPE_P(arg1)) {
@@ -699,7 +712,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
         long byte_len = sv_chars_to_bytes(sv, byte_off, 1);
 
-        return sv_new_from_backing(backing,
+        return sv_new_from_parent(sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -711,7 +724,6 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
 static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
     if (SV_UNLIKELY(argc < 1 || argc > 2)) {
@@ -729,7 +741,7 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
         if (len < 0) return Qnil;
         if (off + len > sv->length) len = sv->length - off;
 
-        return sv_new_from_backing(backing, sv->offset + off, len);
+        return sv_new_from_parent(sv, sv->offset + off, len);
     }
 
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
@@ -755,14 +767,14 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
         if (beg > sv->length) return Qnil;
         if (beg + len > sv->length) len = sv->length - beg;
 
-        return sv_new_from_backing(backing, sv->offset + beg, len);
+        return sv_new_from_parent(sv, sv->offset + beg, len);
     }
 
     {
         long idx = NUM2LONG(arg1);
         if (idx < 0) idx += sv->length;
         if (idx < 0 || idx >= sv->length) return Qnil;
-        return sv_new_from_backing(backing, sv->offset + idx, 1);
+        return sv_new_from_parent(sv, sv->offset + idx, 1);
     }
 }
 
