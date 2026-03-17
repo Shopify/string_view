@@ -591,21 +591,33 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     arg2 = (argc == 2) ? argv[1] : Qnil;
 
     if (argc == 2) {
-        long char_idx = NUM2LONG(arg1);
-        long char_len = NUM2LONG(arg2);
+        long idx = NUM2LONG(arg1);
+        long len = NUM2LONG(arg2);
+
+        if (SV_LIKELY(sv_single_byte_optimizable(sv))) {
+            /* Fast path: char == byte for ASCII content */
+            long total = sv->length;
+            if (idx < 0) idx += total;
+            if (SV_UNLIKELY(idx < 0 || idx > total || len < 0)) return Qnil;
+            if (idx + len > total) len = total - idx;
+            return sv_new_from_backing(backing,
+                                       sv->offset + idx,
+                                       len);
+        }
+
+        /* Slow path: multibyte encoding */
         long total_chars = sv_char_count(sv);
+        if (idx < 0) idx += total_chars;
+        if (idx < 0 || idx > total_chars) return Qnil;
+        if (len < 0) return Qnil;
 
-        if (char_idx < 0) char_idx += total_chars;
-        if (char_idx < 0 || char_idx > total_chars) return Qnil;
-        if (char_len < 0) return Qnil;
-
-        long byte_off = sv_char_to_byte_offset(sv, char_idx);
+        long byte_off = sv_char_to_byte_offset(sv, idx);
         if (byte_off < 0) return Qnil;
 
-        long remaining_chars = total_chars - char_idx;
-        if (char_len > remaining_chars) char_len = remaining_chars;
+        long remaining_chars = total_chars - idx;
+        if (len > remaining_chars) len = remaining_chars;
 
-        long byte_len = sv_chars_to_bytes(sv, byte_off, char_len);
+        long byte_len = sv_chars_to_bytes(sv, byte_off, len);
 
         return sv_new_from_backing(backing,
                                    sv->offset + byte_off,
