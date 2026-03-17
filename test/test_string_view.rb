@@ -1012,25 +1012,8 @@ class TestStringView < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
-  # dangling? — currently always false (strong marks keep backing alive).
-  # The API exists so that when rb_gc_mark_weak becomes public, we can
-  # switch to true non-owning semantics with zero API changes.
+  # GC safety — strong marks keep the backing alive
   # ---------------------------------------------------------------------------
-
-  def test_dangling_predicate_false_when_backing_alive
-    str = +"hello world"
-    sv = StringView.new(str)
-    refute_predicate sv, :dangling?
-  end
-
-  def test_dangling_false_even_after_gc
-    sv = StringView.new(+"hello world")
-    # Strong mark keeps backing alive even though caller dropped their ref.
-    GC.start
-    GC.start
-    refute_predicate sv, :dangling?
-    assert_equal "hello world", sv.to_s
-  end
 
   def test_view_survives_gc_without_external_reference
     sv = StringView.new(+"hello world")
@@ -1048,8 +1031,6 @@ class TestStringView < Minitest::Test
     sv2 = StringView.new(str, 7, 7) # "backing"
 
     GC.start
-    refute_predicate sv1, :dangling?
-    refute_predicate sv2, :dangling?
     assert_equal "shared backing string", sv1.to_s
     assert_equal "backing", sv2.to_s
   end

@@ -65,14 +65,6 @@ static string_view_t *sv_get_struct(VALUE self) {
     return sv;
 }
 
-static VALUE sv_backing_or_raise(string_view_t *sv) {
-    if (sv->backing == Qnil) {
-        rb_raise(rb_eRuntimeError,
-            "StringView is dangling: backing string has been garbage collected");
-    }
-    return sv->backing;
-}
-
 /* Pointer to the start of this view's bytes */
 static const char *sv_ptr(string_view_t *sv) {
     return RSTRING_PTR(sv->backing) + sv->offset;
@@ -164,21 +156,16 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
 }
 
 /* ========================================================================= */
-/* to_s / materialize / inspect / dangling? / reset!                         */
+/* to_s / materialize / inspect / reset!                                     */
 /* ========================================================================= */
 
 static VALUE sv_to_s(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     return rb_enc_str_new(sv_ptr(sv), sv->length, sv_enc(sv));
 }
 
 static VALUE sv_inspect(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    if (sv->backing == Qnil) {
-        return rb_sprintf("#<StringView:%p (dangling) offset=%ld length=%ld>",
-                          (void *)self, sv->offset, sv->length);
-    }
     VALUE content = rb_enc_str_new(sv_ptr(sv), sv->length, sv_enc(sv));
     return rb_sprintf("#<StringView:%p \"%"PRIsVALUE"\" offset=%ld length=%ld>",
                       (void *)self, content, sv->offset, sv->length);
@@ -186,11 +173,6 @@ static VALUE sv_inspect(VALUE self) {
 
 static VALUE sv_frozen_p(VALUE self) {
     return Qtrue;
-}
-
-static VALUE sv_dangling_p(VALUE self) {
-    string_view_t *sv = sv_get_struct(self);
-    return sv->backing == Qnil ? Qtrue : Qfalse;
 }
 
 /*
@@ -230,13 +212,11 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
 
 static VALUE sv_bytesize(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     return LONG2NUM(sv->length);
 }
 
 static VALUE sv_length(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv);
     long chars = rb_enc_strlen(p, p + sv->length, enc);
@@ -245,19 +225,16 @@ static VALUE sv_length(VALUE self) {
 
 static VALUE sv_empty_p(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     return sv->length == 0 ? Qtrue : Qfalse;
 }
 
 static VALUE sv_encoding(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     return rb_enc_from_encoding(sv_enc(sv));
 }
 
 static VALUE sv_ascii_only_p(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     long i;
     for (i = 0; i < sv->length; i++) {
@@ -272,7 +249,6 @@ static VALUE sv_ascii_only_p(VALUE self) {
 
 static VALUE sv_include_p(VALUE self, VALUE substr) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     StringValue(substr);
     const char *p = sv_ptr(sv);
     long slen = RSTRING_LEN(substr);
@@ -285,7 +261,6 @@ static VALUE sv_include_p(VALUE self, VALUE substr) {
 
 static VALUE sv_start_with_p(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     int i;
 
@@ -301,7 +276,6 @@ static VALUE sv_start_with_p(int argc, VALUE *argv, VALUE self) {
 
 static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     int i;
 
@@ -330,7 +304,6 @@ static VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
 
 static VALUE sv_getbyte(VALUE self, VALUE vidx) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     long idx = NUM2LONG(vidx);
     if (idx < 0) idx += sv->length;
     if (idx < 0 || idx >= sv->length) return Qnil;
@@ -355,7 +328,6 @@ static VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
 
 static VALUE sv_each_byte(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     RETURN_ENUMERATOR(self, 0, 0);
     const char *p = sv_ptr(sv);
     long i;
@@ -367,7 +339,6 @@ static VALUE sv_each_byte(VALUE self) {
 
 static VALUE sv_each_char(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     RETURN_ENUMERATOR(self, 0, 0);
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv);
@@ -382,7 +353,6 @@ static VALUE sv_each_char(VALUE self) {
 
 static VALUE sv_bytes(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     VALUE ary = rb_ary_new_capa(sv->length);
     long i;
@@ -394,7 +364,6 @@ static VALUE sv_bytes(VALUE self) {
 
 static VALUE sv_chars(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     rb_encoding *enc = sv_enc(sv);
     const char *p = sv_ptr(sv);
     const char *e = p + sv->length;
@@ -463,12 +432,10 @@ static VALUE sv_oct(VALUE self) {
 
 static VALUE sv_eq(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
 
     if (rb_obj_is_kind_of(other, cStringView)) {
         string_view_t *o = sv_get_struct(other);
-        sv_backing_or_raise(o);
         if (sv->length != o->length) return Qfalse;
         return memcmp(p, sv_ptr(o), sv->length) == 0 ? Qtrue : Qfalse;
     }
@@ -483,14 +450,12 @@ static VALUE sv_eq(VALUE self, VALUE other) {
 
 static VALUE sv_cmp(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     const char *op;
     long olen;
 
     if (rb_obj_is_kind_of(other, cStringView)) {
         string_view_t *o = sv_get_struct(other);
-        sv_backing_or_raise(o);
         op = sv_ptr(o);
         olen = o->length;
     } else if (RB_TYPE_P(other, T_STRING)) {
@@ -518,7 +483,6 @@ static VALUE sv_eql_p(VALUE self, VALUE other) {
 
 static VALUE sv_hash(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    sv_backing_or_raise(sv);
     const char *p = sv_ptr(sv);
     st_index_t h = rb_memhash(p, sv->length);
     h ^= (st_index_t)rb_enc_get_index(sv->backing);
@@ -601,7 +565,7 @@ static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
 
 static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE backing = sv_backing_or_raise(sv);
+    VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
     rb_scan_args(argc, argv, "11", &arg1, &arg2);
@@ -715,7 +679,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
 static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE backing = sv_backing_or_raise(sv);
+    VALUE backing = sv->backing;
     VALUE arg1, arg2;
 
     rb_scan_args(argc, argv, "11", &arg1, &arg2);
@@ -812,10 +776,6 @@ SV_DELEGATE_FUNCALL(unicode_normalize, "unicode_normalize")
 /* ========================================================================= */
 
 static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
-    string_view_t *sv = sv_get_struct(self);
-    if (sv->backing == Qnil) {
-        rb_raise(rb_eFrozenError, "can't modify frozen StringView (dangling)");
-    }
     VALUE str = sv_to_s(self);
     rb_raise(rb_eFrozenError, "can't modify frozen StringView: \"%s\"",
              StringValueCStr(str));
@@ -836,7 +796,6 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "to_s",       sv_to_s,       0);
     rb_define_method(cStringView, "inspect",    sv_inspect,    0);
     rb_define_method(cStringView, "frozen?",    sv_frozen_p,   0);
-    rb_define_method(cStringView, "dangling?",  sv_dangling_p, 0);
     rb_define_method(cStringView, "reset!",     sv_reset,      3);
     rb_define_alias(cStringView,  "materialize", "to_s");
 
