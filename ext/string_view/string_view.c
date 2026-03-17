@@ -1,7 +1,7 @@
 #include "ruby.h"
 #include "ruby/encoding.h"
 #include "ruby/re.h"
-#include "simdutf_wrapper.h"
+#include "simdutf_c.h"
 
 #define SV_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define SV_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -619,20 +619,51 @@ static const unsigned char utf8_char_len[256] = {
 
 /*
  * Find the byte offset of the char_idx-th character in a UTF-8 string.
- * Uses a lookup table for branchless character width.
+ *
+ * Uses SIMD-accelerated binary search: repeatedly halve the byte range
+ * and use simdutf_count_utf8 (NEON/SSE/AVX) to count characters in each
+ * half. This gives O(log n) SIMD passes instead of O(n) scalar scan.
+ *
+ * Once the range is small enough (< 64 bytes), fall back to scalar
+ * lookup table scan for the final characters.
  */
 static long sv_utf8_char_to_byte_offset(const char *p, long len, long char_idx) {
-    const unsigned char *s = (const unsigned char *)p;
-    const unsigned char *e = s + len;
-    long chars = 0;
+    if (char_idx == 0) return 0;
 
-    while (s < e && chars < char_idx) {
-        s += utf8_char_len[*s];
-        chars++;
+    /* Binary search: narrow byte range using SIMD char counting */
+    long lo = 0, hi = len;
+    long chars_before_lo = 0;  /* characters in p[0..lo) */
+    long target = char_idx;
+
+    while (hi - lo >= 64) {
+        long mid = lo + (hi - lo) / 2;
+        /* Ensure mid lands on a character boundary (not a continuation byte) */
+        while (mid < hi && ((unsigned char)p[mid] & 0xC0) == 0x80) mid++;
+        if (mid >= hi) break;
+
+        long chars_in_range = (long)simdutf_count_utf8(p + lo, mid - lo);
+        if (chars_before_lo + chars_in_range < target) {
+            /* Target is in the right half */
+            chars_before_lo += chars_in_range;
+            lo = mid;
+        } else {
+            /* Target is in the left half */
+            hi = mid;
+        }
     }
 
-    if (chars < char_idx) return -1;
-    return (const char *)s - p;
+    /* Scalar scan for the remaining small range */
+    const unsigned char *s = (const unsigned char *)p + lo;
+    const unsigned char *e = (const unsigned char *)p + hi;
+    long remaining = target - chars_before_lo;
+
+    while (s < e && remaining > 0) {
+        s += utf8_char_len[*s];
+        remaining--;
+    }
+
+    if (remaining > 0) return -1;
+    return (long)(s - (const unsigned char *)p);
 }
 
 /*
@@ -754,35 +785,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
             if (idx < 0) return Qnil;
         }
 
-        if (SV_LIKELY(sv_is_utf8(sv))) {
-            /* UTF-8 combined single-pass: find byte_off for idx chars,
-             * then continue scanning len more chars for byte_len */
-            const unsigned char *s = (const unsigned char *)sv_ptr(sv);
-            const unsigned char *e = s + sv->length;
-            long chars = 0;
-
-            /* Phase 1: skip idx characters to find byte_off */
-            while (s < e && chars < idx) {
-                s += utf8_char_len[*s];
-                chars++;
-            }
-            if (chars < idx) return Qnil;
-
-            const unsigned char *slice_start = s;
-
-            /* Phase 2: skip len more characters to find byte_len */
-            long counted = 0;
-            while (s < e && counted < len) {
-                s += utf8_char_len[*s];
-                counted++;
-            }
-
-            return sv_new_from_parent(sv,
-                                       sv->offset + (long)((const char *)slice_start - (const char *)sv_ptr(sv)),
-                                       (long)(s - slice_start));
-        }
-
-        /* Generic multibyte fallback */
+        /* Use SIMD-accelerated char_to_byte for UTF-8, generic for others */
         long byte_off = sv_char_to_byte_offset(sv, idx);
         if (byte_off < 0) return Qnil;
 
