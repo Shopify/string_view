@@ -991,9 +991,9 @@ class TestStringView < Minitest::Test
     assert_equal 5, sv.length
     assert_equal 5, sv.bytesize
 
-    sv.reset!("café latte", 0, 5) # "café " (4 chars, 5 bytes because é is 2 bytes)
+    sv.reset!("café latte", 0, 6) # "café " (5 chars, 6 bytes because é is 2 bytes)
     assert_equal "café ", sv.to_s
-    assert_equal 5, sv.bytesize
+    assert_equal 6, sv.bytesize
   end
 
   def test_reset_allows_slicing_after
@@ -1023,8 +1023,9 @@ class TestStringView < Minitest::Test
 
   def test_dangling_after_gc_collects_backing
     sv = StringView.new(+"hello world")
-    # The only reference to the backing string is inside the StringView,
-    # which holds it weakly. Drop it and force GC.
+    sv.weaken!
+    # The only strong reference to the backing string is gone.
+    # The WeakMap holds it weakly. Force GC.
     GC.start
     GC.start # run twice to be thorough
 
@@ -1151,12 +1152,13 @@ class TestStringView < Minitest::Test
   private
 
   # Helper: create a StringView whose backing has no strong references.
-  # The GC _may_ collect it, making the view dangling.
+  # The view is weakened so the GC _may_ collect the backing.
   # We aggressively GC to maximize the chance.
   def make_dangling_view(content)
     sv = StringView.new(+content)
+    sv.weaken!
     # At this point, the only reference to the frozen backing is the weak ref
-    # inside the StringView. Force GC to try to collect it.
+    # inside the WeakMap. Force GC to try to collect it.
     4.times { GC.start }
     sv
   end
