@@ -86,10 +86,9 @@ static size_t sv_memsize(const void *ptr) {
 }
 
 static const rb_data_type_t string_view_type = {
-    "StringView",
-    { sv_mark, sv_free, sv_memsize, sv_compact },
-    0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE
+    .wrap_struct_name = "StringView",
+    .function = { .dmark = sv_mark, .dfree = sv_free, .dsize = sv_memsize, .dcompact = sv_compact },
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE,
 };
 
 /* Forward declarations */
@@ -140,23 +139,6 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     return obj;
 }
 
-/* Allocate a new StringView VALUE pointing into a raw backing string */
-SV_INLINE VALUE sv_new_from_backing(VALUE backing, long offset, long length) {
-    string_view_t *sv;
-    VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
-                                     &string_view_type, sv);
-    rb_encoding *enc = rb_enc_get(backing);
-    RB_OBJ_WRITE(obj, &sv->backing, backing);
-    sv->base        = RSTRING_PTR(backing);
-    sv->enc         = enc;
-    sv->offset      = offset;
-    sv->length      = length;
-    sv->single_byte = sv_compute_single_byte(backing, enc);
-    sv->charlen     = -1;
-    sv->stride_idx  = NULL;
-    FL_SET_RAW(obj, FL_FREEZE);
-    return obj;
-}
 
 /* ========================================================================= */
 /* Construction                                                              */
@@ -681,13 +663,11 @@ static void sv_build_stride_index(string_view_t *sv) {
     const unsigned char *p = (const unsigned char *)sv_ptr(sv);
     const unsigned char *e = p + sv->length;
     long entry = 0;
-    long byte_pos = 0;
 
     idx->offsets[entry++] = 0; /* char 0 is at byte 0 */
 
     /* Walk the string, recording byte offset every STRIDE_CHARS characters */
     const unsigned char *s = p;
-    long char_pos = 0;
 
     while (s < e && entry < n_entries) {
         /* Advance STRIDE_CHARS characters */
@@ -696,7 +676,6 @@ static void sv_build_stride_index(string_view_t *sv) {
             s += utf8_char_len[*s];
             remaining--;
         }
-        char_pos += STRIDE_CHARS - remaining;
         idx->offsets[entry++] = (long)(s - p);
     }
 
