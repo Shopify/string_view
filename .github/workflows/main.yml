@@ -13,8 +13,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    name: Ruby ${{ matrix.ruby }}
+    name: Test Ruby ${{ matrix.ruby }}
     strategy:
+      fail-fast: false
       matrix:
         ruby:
           - '3.3'
@@ -35,6 +36,31 @@ jobs:
         run: bundle exec rake compile
       - name: Test
         run: bundle exec rake test
+
+  lint:
+    runs-on: ubuntu-latest
+    name: Lint
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
       - name: RuboCop
         run: bundle exec rubocop
-        if: matrix.ruby == '4.0'
+
+  ci:
+    runs-on: ubuntu-latest
+    name: CI
+    needs: [test, lint]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.test.result }}" != "success" || "${{ needs.lint.result }}" != "success" ]]; then
+            echo "Test result: ${{ needs.test.result }}"
+            echo "Lint result: ${{ needs.lint.result }}"
+            exit 1
+          fi
