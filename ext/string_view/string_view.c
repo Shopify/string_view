@@ -68,9 +68,7 @@ static const rb_data_type_t string_view_type = {
 /* ========================================================================= */
 
 SV_INLINE string_view_t *sv_get_struct(VALUE self) {
-    string_view_t *sv;
-    TypedData_Get_Struct(self, string_view_t, &string_view_type, sv);
-    return sv;
+    return (string_view_t *)RTYPEDDATA_GET_DATA(self);
 }
 
 /* Pointer to the start of this view's bytes */
