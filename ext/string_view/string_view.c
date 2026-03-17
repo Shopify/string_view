@@ -52,19 +52,15 @@ static void sv_compact(void *ptr) {
     }
 }
 
-static void sv_free(void *ptr) {
-    xfree(ptr);
-}
-
 static size_t sv_memsize(const void *ptr) {
     return sizeof(string_view_t);
 }
 
 static const rb_data_type_t string_view_type = {
     "StringView",
-    { sv_mark, sv_free, sv_memsize, sv_compact },
+    { sv_mark, RUBY_TYPED_DEFAULT_FREE, sv_memsize, sv_compact },
     0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE
 };
 
 /* ========================================================================= */
