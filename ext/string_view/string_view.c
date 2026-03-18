@@ -93,6 +93,7 @@ static const rb_data_type_t string_view_type = {
 
 /* Forward declarations */
 static int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
+SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
 
 /* ========================================================================= */
 /* Internal helpers                                                          */
@@ -312,6 +313,8 @@ static VALUE sv_encoding(VALUE self) {
 
 static VALUE sv_ascii_only_p(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
+    if (sv_single_byte_optimizable(sv)) return Qtrue;
+    /* single_byte resolved to 0 (multibyte) — scan to confirm non-ASCII bytes */
     const char *p = sv_ptr(sv);
     long i;
     for (i = 0; i < sv->length; i++) {
