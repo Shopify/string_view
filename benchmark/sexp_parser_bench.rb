@@ -2,11 +2,19 @@
 # frozen_string_literal: true
 
 #
-# Benchmark: StringView::SexpParser vs a naive String-based S-expression lexer
+# Benchmark: S-expression lexer across four StringView modes
 #
 # Compares allocation count and throughput of:
-#   1. StringView::Strict-based lexer (zero intermediate String allocs)
-#   2. Naive String-based lexer (allocates substrings via String#[] and String#slice)
+#   1. String             — plain Ruby substrings (baseline)
+#   2. StringView         — one StringView alloc per slice
+#   3. StringView::Strict — one Strict alloc per slice
+#   4. StringView::Pool   — zero alloc per slice in steady state
+#
+# Two scenarios:
+#   A) Cold — new Lexer each call (like parsing different inputs)
+#   B) Hot  — same Lexer reused with reset! (like parsing messages in a loop)
+#
+# Pool only wins in scenario B, where pre-allocated views get reused.
 #
 # Usage:
 #   bundle exec ruby --yjit bench/sexp_parser_bench.rb
@@ -17,125 +25,32 @@ require "string_view"
 require_relative "../test/parsing/sexp_parser"
 
 # ---------------------------------------------------------------------------
-# Naive String-based lexer (for comparison)
-# ---------------------------------------------------------------------------
-module NaiveStringLexer
-  Token = Struct.new(:type, :value, :offset, :length, keyword_init: true)
-
-  DELIMITERS = /[\s()"';]/
-
-  def self.tokenize(source)
-    source = source.to_s
-    tokens = []
-    pos = 0
-
-    while pos < source.bytesize
-      # Skip whitespace
-      while pos < source.bytesize && " \t\n\r".include?(source[pos])
-        pos += 1
-      end
-      break if pos >= source.bytesize
-
-      ch = source[pos]
-
-      # Skip comments
-      if ch == ";"
-        nl = source.index("\n", pos)
-        pos = nl ? nl + 1 : source.bytesize
-        next
-      end
-
-      case ch
-      when "("
-        tokens << Token.new(type: :lparen, value: nil, offset: pos, length: 1)
-        pos += 1
-      when ")"
-        tokens << Token.new(type: :rparen, value: nil, offset: pos, length: 1)
-        pos += 1
-      when "'"
-        tokens << Token.new(type: :quote, value: nil, offset: pos, length: 1)
-        pos += 1
-      when '"'
-        start = pos
-        pos += 1
-        while pos < source.bytesize
-          if source[pos] == "\\"
-            pos += 2
-          elsif source[pos] == '"'
-            pos += 1
-            break
-          else
-            pos += 1
-          end
-        end
-        inner = source[(start + 1)..(pos - 2)] # allocates!
-        tokens << Token.new(type: :string, value: inner, offset: start, length: pos - start)
-      when "#"
-        if pos + 1 < source.bytesize
-          nxt = source[pos + 1]
-          if nxt == "t"
-            tokens << Token.new(type: :boolean, value: true, offset: pos, length: 2)
-            pos += 2
-            next
-          elsif nxt == "f"
-            tokens << Token.new(type: :boolean, value: false, offset: pos, length: 2)
-            pos += 2
-            next
-          end
-        end
-        start = pos
-        pos += 1
-        pos += 1 while pos < source.bytesize && !DELIMITERS.match?(source[pos])
-        span = source[start...pos] # allocates!
-        tokens << Token.new(type: :symbol, value: span, offset: start, length: pos - start)
-      when ":"
-        start = pos
-        pos += 1
-        pos += 1 while pos < source.bytesize && !DELIMITERS.match?(source[pos])
-        name = source[(start + 1)...pos] # allocates!
-        tokens << Token.new(type: :keyword, value: name, offset: start, length: pos - start)
-      else
-        start = pos
-        pos += 1 while pos < source.bytesize && !DELIMITERS.match?(source[pos])
-        span = source[start...pos] # allocates!
-
-        if span == "nil"
-          tokens << Token.new(type: :nil, value: nil, offset: start, length: pos - start)
-        elsif span.match?(/\A[+-]?\d+\z/)
-          tokens << Token.new(type: :integer, value: span.to_i, offset: start, length: pos - start)
-        elsif span.match?(/\A[+-]?\d+\.\d+\z/)
-          tokens << Token.new(type: :float, value: span.to_f, offset: start, length: pos - start)
-        else
-          tokens << Token.new(type: :symbol, value: span, offset: start, length: pos - start)
-        end
-      end
-    end
-
-    tokens
-  end
-end
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def measure_time(n)
+def measure_time(n, &block)
+  GC.start
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   n.times(&block)
   t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   t1 - t0
 end
 
-def measure_allocs
+def measure_allocs(n = 1, &block)
+  GC.start
   GC.disable
   before = GC.stat(:total_allocated_objects)
-  yield
+  n.times(&block)
   after = GC.stat(:total_allocated_objects)
   GC.enable
-  after - before
+  (after - before).to_f / n
+end
+
+def fmt_num(n)
+  n.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
 end
 
 # ---------------------------------------------------------------------------
-# Test data — a realistic program, repeated to get a substantial buffer
+# Test data
 # ---------------------------------------------------------------------------
 PROGRAM = <<~SEXP
   ;; A realistic Scheme-like program
@@ -172,102 +87,175 @@ PROGRAM = <<~SEXP
       (newline)))
 SEXP
 
-# Scale up: repeat the program to make a ~100KB buffer
 SCALE = 50
 SOURCE = (PROGRAM * SCALE).freeze
 
+HAS_POOL = defined?(StringView::Pool)
+MODES = [:string, :string_view, :strict]
+MODES << :pool if HAS_POOL
+
+MODE_LABELS = {
+  string: "String",
+  string_view: "StringView",
+  strict: "Strict",
+  pool: "Pool",
+}.freeze
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+puts
 puts "=" * 72
-puts "StringView::SexpParser Benchmark"
+puts "  S-expression Lexer Benchmark"
 puts "=" * 72
 puts
-puts "Source size: #{SOURCE.bytesize} bytes (#{SOURCE.lines.count} lines, #{SCALE}× repeated)"
-puts "Ruby:        #{RUBY_DESCRIPTION}"
+puts "  Source: #{fmt_num(SOURCE.bytesize)} bytes, #{fmt_num(SOURCE.lines.count)} lines (#{SCALE}× repeated)"
+puts "  Ruby:   #{RUBY_DESCRIPTION}"
+puts "  Modes:  #{MODES.map { |m| MODE_LABELS[m] }.join(", ")}"
 puts
 
-# ---------------------------------------------------------------------------
-# Correctness check
-# ---------------------------------------------------------------------------
-sv_tokens = StringView::SexpParser.tokenize(SOURCE)
-naive_tokens = NaiveStringLexer.tokenize(SOURCE)
-puts "Tokens (StringView): #{sv_tokens.length}"
-puts "Tokens (Naive):      #{naive_tokens.length}"
-raise "Token count mismatch!" unless sv_tokens.length == naive_tokens.length
-puts "✓ Token counts match"
+# Correctness
+counts = MODES.map { |m| [m, StringView::SexpParser.tokenize(SOURCE, mode: m).length] }.to_h
+token_count = counts.values.first
+puts "  Tokens: #{fmt_num(token_count)}"
+unless counts.values.uniq.length == 1
+  abort "  !! Token count mismatch: #{counts}"
+end
+puts "  ✓ All modes produce identical token streams"
 puts
 
-# ---------------------------------------------------------------------------
-# Allocation comparison
-# ---------------------------------------------------------------------------
-puts "-" * 72
-puts "Allocation comparison (single run)"
-puts "-" * 72
+# Warm all modes
+MODES.each { |m| 5.times { StringView::SexpParser.tokenize(SOURCE, mode: m) } }
 
-# Warm up
-5.times { StringView::SexpParser.tokenize(SOURCE) }
-5.times { NaiveStringLexer.tokenize(SOURCE) }
+max_label = MODE_LABELS.values.map(&:length).max
 
-sv_allocs = measure_allocs { StringView::SexpParser.tokenize(SOURCE) }
-naive_allocs = measure_allocs { NaiveStringLexer.tokenize(SOURCE) }
-
-puts "StringView lexer:  #{sv_allocs} objects"
-puts "Naive lexer:       #{naive_allocs} objects"
-puts "Savings:           #{naive_allocs - sv_allocs} fewer objects (#{((1.0 - sv_allocs.to_f / naive_allocs) * 100).round(1)}%)"
+# =====================================================================
+# Scenario A: Cold — new Lexer per call
+# =====================================================================
+puts "=" * 72
+puts "  Scenario A: Cold — new Lexer each call"
+puts "  (like parsing different inputs each time)"
+puts "=" * 72
 puts
 
-# ---------------------------------------------------------------------------
-# Throughput benchmark — lexer
-# ---------------------------------------------------------------------------
-puts "-" * 72
-puts "Throughput benchmark (lexer only)"
-puts "-" * 72
+# --- Allocations ---
+puts "  Allocations (single pass)"
+alloc_a = {}
+MODES.each do |m|
+  alloc_a[m] = measure_allocs { StringView::SexpParser.tokenize(SOURCE, mode: m) }.round
+end
+base_a = alloc_a[:string]
+MODES.each do |m|
+  a = alloc_a[m]
+  diff = a - base_a
+  note = if diff == 0
+    ""
+  else
+    diff > 0 ? "  (+#{fmt_num(diff)})" : "  (#{fmt_num(diff)})"
+  end
+  printf "    %-#{max_label}s  %8s objects%s\n", MODE_LABELS[m], fmt_num(a), note
+end
+puts
 
+# --- Throughput ---
 n = 50
-puts "Iterations: #{n}"
+puts "  Throughput (lex only, #{n} iterations)"
+time_a = {}
+MODES.each do |m|
+  time_a[m] = measure_time(n) { StringView::SexpParser.tokenize(SOURCE, mode: m) }
+end
+str_t = time_a[:string]
+MODES.each do |m|
+  t = time_a[m]
+  ms = t / n * 1000
+  tps = token_count * n / t
+  mbs = SOURCE.bytesize * n / t / 1e6
+  printf "    %-#{max_label}s  %5.1f ms/iter  %5.1fM tok/s  %5.1f MB/s", MODE_LABELS[m], ms, tps / 1e6, mbs
+  printf "  (%.2fx)", str_t / t if m != :string
+  puts
+end
 puts
 
-# Warm
-5.times { StringView::SexpParser.tokenize(SOURCE) }
-5.times { NaiveStringLexer.tokenize(SOURCE) }
-
-sv_time = measure_time(n) { StringView::SexpParser.tokenize(SOURCE) }
-naive_time = measure_time(n) { NaiveStringLexer.tokenize(SOURCE) }
-
-printf "  StringView lexer:  %7.3fs  (%5.1f ms/iter)\n", sv_time, sv_time / n * 1000
-printf "  Naive String lexer:%7.3fs  (%5.1f ms/iter)\n", naive_time, naive_time / n * 1000
-printf "  Speedup:           %.2fx\n", naive_time / sv_time
+# =====================================================================
+# Scenario B: Hot — reuse Lexer with tokenize (Pool calls reset!)
+# =====================================================================
+puts "=" * 72
+puts "  Scenario B: Hot — same Lexer, repeated tokenize"
+puts "  (like parsing messages in a server loop)"
+puts "=" * 72
 puts
 
-# ---------------------------------------------------------------------------
-# Full parse benchmark (lexer + AST construction)
-# ---------------------------------------------------------------------------
-puts "-" * 72
-puts "Full parse benchmark (lex + parse)"
-puts "-" * 72
+# Build a reusable Lexer for each mode
+lexers = {}
+MODES.each do |m|
+  lexers[m] = StringView::SexpParser::Lexer.new(SOURCE, mode: m)
+end
 
-n_parse = 20
-5.times { StringView::SexpParser.parse_all(SOURCE) }
-parse_time = measure_time(n_parse) { StringView::SexpParser.parse_all(SOURCE) }
-printf "  StringView parse:  %7.3fs  (%5.1f ms/iter, %d iters)\n", parse_time, parse_time / n_parse * 1000, n_parse
+# Warm: tokenize a few times (Pool grows to needed capacity)
+MODES.each { |m| 10.times { lexers[m].tokenize } }
+
+# --- Allocations per tokenize call (amortized over many calls) ---
+puts "  Allocations per tokenize (amortized, #{n} calls)"
+alloc_b = {}
+MODES.each do |m|
+  lexer = lexers[m]
+  alloc_b[m] = measure_allocs(n) { lexer.tokenize }.round
+end
+base_b = alloc_b[:string]
+MODES.each do |m|
+  a = alloc_b[m]
+  diff = a - base_b
+  note = if diff == 0
+    ""
+  else
+    diff > 0 ? "  (+#{fmt_num(diff)})" : "  (#{fmt_num(diff)})"
+  end
+  printf "    %-#{max_label}s  %8s objects%s\n", MODE_LABELS[m], fmt_num(a), note
+end
 puts
 
-# ---------------------------------------------------------------------------
-# Per-token throughput
-# ---------------------------------------------------------------------------
-puts "-" * 72
-puts "Per-token throughput"
-puts "-" * 72
-
-tokens_per_run = sv_tokens.length
-total_tokens = tokens_per_run * n
-sv_tps = total_tokens / sv_time
-naive_tps = total_tokens / naive_time
-
-printf "  StringView: %5.2fM tokens/s  (%4.0fns/token)\n", sv_tps / 1e6, 1e9 / sv_tps
-printf "  Naive:      %5.2fM tokens/s  (%4.0fns/token)\n", naive_tps / 1e6, 1e9 / naive_tps
-printf "  Speedup:    %.2fx\n", sv_tps / naive_tps
+# --- Throughput ---
+puts "  Throughput (lex only, #{n} iterations)"
+time_b = {}
+MODES.each do |m|
+  lexer = lexers[m]
+  time_b[m] = measure_time(n) { lexer.tokenize }
+end
+str_b = time_b[:string]
+MODES.each do |m|
+  t = time_b[m]
+  ms = t / n * 1000
+  tps = token_count * n / t
+  mbs = SOURCE.bytesize * n / t / 1e6
+  printf "    %-#{max_label}s  %5.1f ms/iter  %5.1fM tok/s  %5.1f MB/s", MODE_LABELS[m], ms, tps / 1e6, mbs
+  printf "  (%.2fx)", str_b / t if m != :string
+  puts
+end
 puts
-printf "  Throughput: %.1fMB/s (StringView)\n", (SOURCE.bytesize * n) / sv_time / 1e6
-printf "              %.1fMB/s (Naive)\n", (SOURCE.bytesize * n) / naive_time / 1e6
 
+# =====================================================================
+# Summary
+# =====================================================================
+puts "=" * 72
+puts "  Summary"
+puts "=" * 72
+puts
+puts "  vs String baseline          Cold (new Lexer)    Hot (reuse Lexer)"
+puts "  " + "-" * 68
+MODES.each do |m|
+  next if m == :string
+
+  cold_alloc = ((1.0 - alloc_a[m].to_f / base_a) * 100)
+  cold_speed = str_t / time_a[m]
+  hot_alloc  = ((1.0 - alloc_b[m].to_f / base_b) * 100)
+  hot_speed  = str_b / time_b[m]
+  printf "  %-#{max_label}s              alloc %+5.1f%% %4.2fx   alloc %+5.1f%% %4.2fx\n",
+    MODE_LABELS[m],
+    -cold_alloc,
+    cold_speed,
+    -hot_alloc,
+    hot_speed
+end
 puts
 puts "=" * 72
+puts

@@ -3,17 +3,17 @@
 require "string_view"
 
 #
-# StringView::SexpParser — a zero-allocation S-expression lexer and parser
-# built entirely on StringView::Strict.
+# StringView::SexpParser — an S-expression lexer and parser that can run
+# in four modes to compare allocation strategies:
 #
-# Demonstrates how to build a real lexer/parser loop that:
-#   - Never allocates intermediate String objects during tokenization
-#   - Uses manual byte-position tracking instead of StringScanner (which allocates)
-#   - Exercises nearly every zero-copy method on StringView::Strict:
-#     strip, lstrip, rstrip, chomp, chop, delete_prefix, delete_suffix, chr,
-#     index, byteindex, include?, start_with?, end_with?, getbyte, byteslice,
-#     empty?, ord, valid_encoding?, to_i, to_f, bytesize, length, ==, eql?
-#   - Produces an AST of Token structs and nested lists
+#   :string        — plain Ruby String (allocates substrings)
+#   :string_view   — StringView (one alloc per view)
+#   :strict        — StringView::Strict (one alloc per view, no accidental to_s)
+#   :pool          — StringView::Pool (zero alloc in steady state)
+#
+# The grammar, token types, and AST structure are identical across all modes.
+# Only the slice operation differs — how the lexer extracts a byte range from
+# the source buffer.
 #
 # == Grammar
 #
@@ -28,13 +28,7 @@ require "string_view"
 #   keyword    = ':' symbol
 #   boolean    = '#t' | '#f'
 #   nil_lit    = 'nil'
-#   comment    = ';' to end of line (stripped)
-#
-# == Usage
-#
-#   source = '(define (square x) (* x x))'
-#   parser = StringView::SexpParser.new(source)
-#   ast    = parser.parse  # => nested arrays of Token structs
+#   comment    = ';' to end of line
 #
 # == Token types
 #
@@ -44,45 +38,61 @@ require "string_view"
 module StringView::SexpParser
   Token = Struct.new(:type, :value, :byte_offset, :byte_length, keyword_init: true)
 
-  # Characters that terminate an atom
-  DELIMITERS = " \t\n\r()\"';".freeze
-  private_constant :DELIMITERS
+  MODES = [:string, :string_view, :strict, :pool].freeze
 
   # --------------------------------------------------------------------------
-  # Lexer — tokenizes a StringView::Strict into Token objects.
+  # Lexer — tokenizes source into Token objects.
   #
-  # This is the hot path. It tracks a byte position into the backing view
-  # and extracts tokens using only zero-copy operations:
+  # The `mode` parameter controls how byte ranges are extracted:
   #
-  #   getbyte      → peek at current byte (character class checks)
-  #   byteslice    → extract token span as a new Strict view
-  #   byteindex    → find next occurrence of delimiter/quote/etc.
-  #   index        → find next occurrence of multi-byte pattern
-  #   chr          → single-character extraction
-  #   strip/lstrip → skip leading whitespace
-  #   start_with?  → check token prefixes
-  #   end_with?    → check token suffixes
-  #   include?     → check for embedded characters
-  #   delete_prefix/delete_suffix → strip known wrappers
-  #   chomp/chop   → strip trailing newline/char
-  #   empty?       → end-of-input check
-  #   ord          → character code for dispatch
-  #   to_i/to_f    → numeric conversion
-  #   valid_encoding? → validate UTF-8
-  #   ==, eql?     → token comparison
-  #   bytesize     → span calculation
-  #   length       → character count (for string literals)
+  #   :string      — source is a String, slicing via source.byteslice
+  #   :string_view — source is a StringView, slicing via source.byteslice
+  #   :strict      — source is a StringView::Strict, slicing via source.byteslice
+  #   :pool        — source is a StringView::Strict, slicing via pool.view
+  #
+  # In all modes, the hot-path byte inspection uses the same methods:
+  # getbyte, index, include?, bytesize, empty?, to_i, to_f, valid_encoding?
   # --------------------------------------------------------------------------
   class Lexer
-    attr_reader :source, :pos, :tokens
+    attr_reader :source, :pos, :tokens, :mode
 
-    # @param source [String, StringView, StringView::Strict]
-    def initialize(source)
-      @source = if source.is_a?(StringView::Strict)
-        source
-      else
-        StringView::Strict.new(source.to_s)
+    # @param source [String, StringView, StringView::Strict] the source to lex
+    # @param mode [Symbol] one of :string, :string_view, :strict, :pool
+    def initialize(source, mode: :strict)
+      raise ArgumentError, "Unknown mode: #{mode}" unless MODES.include?(mode)
+
+      @mode = mode
+
+      # Normalize to a raw String for wrapping in the appropriate type.
+      # StringView::Strict#to_s raises WouldAllocate, so use .materialize.
+      raw = case source
+      when StringView::Strict then source.materialize
+      when StringView then source.to_s
+      when String then source
+      else source.to_s
       end
+
+      case mode
+      when :string
+        @source = raw.freeze
+        @slicer = ->(off, len) { @source.byteslice(off, len) }
+      when :string_view
+        @source = StringView.new(raw)
+        @slicer = ->(off, len) { @source.byteslice(off, len) }
+      when :strict
+        @source = StringView::Strict.new(raw)
+        @slicer = ->(off, len) { @source.byteslice(off, len) }
+      when :pool
+        @source = StringView::Strict.new(raw)
+        @pool = StringView::Pool.new(raw) if defined?(StringView::Pool)
+        @slicer = if @pool
+          ->(off, len) { @pool.view(off, len) }
+        else
+          # Pool not available — fall back to Strict
+          ->(off, len) { @source.byteslice(off, len) }
+        end
+      end
+
       @pos = 0
       @tokens = []
     end
@@ -91,6 +101,7 @@ module StringView::SexpParser
     def tokenize
       @tokens = []
       @pos = 0
+      @pool&.reset! if @mode == :pool
 
       while @pos < @source.bytesize
         skip_whitespace_and_comments
@@ -124,14 +135,18 @@ module StringView::SexpParser
 
     private
 
+    # Extract a byte range from the source using the mode-appropriate strategy.
+    def slice(offset, length)
+      @slicer.call(offset, length)
+    end
+
     def skip_whitespace_and_comments
       while @pos < @source.bytesize
         byte = @source.getbyte(@pos)
-        if byte == 32 || byte == 9 || byte == 10 || byte == 13 # space, tab, nl, cr
+        if byte == 32 || byte == 9 || byte == 10 || byte == 13
           @pos += 1
-        elsif byte == 59 # ';' — comment to end of line
-          # Use index to find the newline — zero-copy search
-          remaining = @source.byteslice(@pos, @source.bytesize - @pos)
+        elsif byte == 59 # ';'
+          remaining = slice(@pos, @source.bytesize - @pos)
           nl_pos = remaining.index("\n")
           if nl_pos
             @pos += nl_pos + 1
@@ -146,13 +161,12 @@ module StringView::SexpParser
 
     def lex_string
       start = @pos
-      @pos += 1 # skip opening '"'
-      # Find closing quote, handling escapes
+      @pos += 1
       while @pos < @source.bytesize
         byte = @source.getbyte(@pos)
-        if byte == 92 # '\\' — escape: skip next byte
+        if byte == 92
           @pos += 2
-        elsif byte == 34 # '"' — closing quote
+        elsif byte == 34
           @pos += 1
           break
         else
@@ -160,11 +174,9 @@ module StringView::SexpParser
         end
       end
 
-      span = @source.byteslice(start, @pos - start)
-      # Validate the string literal is well-formed UTF-8
+      span = slice(start, @pos - start)
       raise "Invalid UTF-8 in string literal at byte #{start}" unless span.valid_encoding?
 
-      # The token value is the inner content: strip quotes with delete_prefix/delete_suffix
       inner = span.delete_prefix('"').delete_suffix('"')
       @tokens << Token.new(type: :string, value: inner, byte_offset: start, byte_length: @pos - start)
     end
@@ -172,24 +184,22 @@ module StringView::SexpParser
     def lex_boolean
       if @pos + 1 < @source.bytesize
         next_byte = @source.getbyte(@pos + 1)
-        if next_byte == 116 # 't'
+        if next_byte == 116
           @tokens << Token.new(type: :boolean, value: true, byte_offset: @pos, byte_length: 2)
           @pos += 2
           return
-        elsif next_byte == 102 # 'f'
+        elsif next_byte == 102
           @tokens << Token.new(type: :boolean, value: false, byte_offset: @pos, byte_length: 2)
           @pos += 2
           return
         end
       end
-      # Not a boolean — treat as atom
       lex_atom
     end
 
     def lex_keyword
       start = @pos
-      @pos += 1 # skip ':'
-      # Read until delimiter
+      @pos += 1
       while @pos < @source.bytesize
         byte = @source.getbyte(@pos)
         break if delimiter_byte?(byte)
@@ -197,16 +207,13 @@ module StringView::SexpParser
         @pos += 1
       end
 
-      span = @source.byteslice(start, @pos - start)
-      # Strip the ':' prefix to get the keyword name
+      span = slice(start, @pos - start)
       name = span.delete_prefix(":")
       @tokens << Token.new(type: :keyword, value: name, byte_offset: start, byte_length: @pos - start)
     end
 
     def lex_atom
       start = @pos
-
-      # Advance until we hit a delimiter
       while @pos < @source.bytesize
         byte = @source.getbyte(@pos)
         break if delimiter_byte?(byte)
@@ -214,7 +221,7 @@ module StringView::SexpParser
         @pos += 1
       end
 
-      span = @source.byteslice(start, @pos - start)
+      span = slice(start, @pos - start)
       return if span.empty?
 
       classify_atom(span, start)
@@ -223,74 +230,59 @@ module StringView::SexpParser
     def classify_atom(span, start)
       first_byte = span.getbyte(0)
 
-      # Check for nil
       if span == "nil"
         @tokens << Token.new(type: :nil, value: nil, byte_offset: start, byte_length: span.bytesize)
         return
       end
 
-      # Check for numeric: starts with digit, or +/- followed by digit
       if digit_byte?(first_byte) || ((first_byte == 43 || first_byte == 45) && span.bytesize > 1 && digit_byte?(span.getbyte(1)))
         @tokens << if span.include?(".")
           Token.new(type: :float, value: span.to_f, byte_offset: start, byte_length: span.bytesize)
         else
           @tokens << Token.new(type: :integer, value: span.to_i, byte_offset: start, byte_length: span.bytesize)
         end
-        return
+          Token.new(type: :integer, value: span.to_i, byte_offset: start, byte_length: span.bytesize)
       end
 
-      # Everything else is a symbol — the value is the Strict view itself (zero-copy)
       @tokens << Token.new(type: :symbol, value: span, byte_offset: start, byte_length: span.bytesize)
     end
 
     def delimiter_byte?(byte)
-      byte == 32 || byte == 9 || byte == 10 || byte == 13 || # whitespace
-        byte == 40 || byte == 41 ||  # ( )
-        byte == 34 || byte == 39 ||  # " '
-        byte == 59                   # ;
+      byte == 32 || byte == 9 || byte == 10 || byte == 13 ||
+        byte == 40 || byte == 41 ||
+        byte == 34 || byte == 39 ||
+        byte == 59
     end
 
     def digit_byte?(byte)
-      byte >= 48 && byte <= 57 # '0'..'9'
+      byte >= 48 && byte <= 57
     end
   end
 
   # --------------------------------------------------------------------------
   # Parser — builds nested AST from token stream.
-  #
-  # The AST is represented as:
-  #   - Lists: Ruby Arrays of AST nodes
-  #   - Atoms: Token structs (type + value)
-  #   - Quoted: [:quote, node]
   # --------------------------------------------------------------------------
   class Parser
-    def initialize(source)
-      @lexer = Lexer.new(source)
+    def initialize(source, mode: :strict)
+      @lexer = Lexer.new(source, mode: mode)
       @tokens = nil
       @pos = 0
     end
 
-    # Parse a single top-level expression.
     def parse
       @tokens = @lexer.tokenize
       @pos = 0
-      node = parse_expr
-      # Verify we consumed everything (or allow trailing whitespace via tokenizer)
-      node
+      parse_expr
     end
 
-    # Parse all top-level expressions (for multi-expression inputs).
     def parse_all
       @tokens = @lexer.tokenize
       @pos = 0
       nodes = []
-      while @pos < @tokens.length
-        nodes << parse_expr
-      end
+      nodes << parse_expr while @pos < @tokens.length
       nodes
     end
 
-    # Expose tokens for testing
     def tokens
       @tokens ||= @lexer.tokenize
     end
@@ -317,34 +309,32 @@ module StringView::SexpParser
     end
 
     def parse_list
-      @pos += 1 # skip '('
+      @pos += 1
       elements = []
 
       while @pos < @tokens.length
-        token = @tokens[@pos]
-        break if token.type == :rparen
+        break if @tokens[@pos].type == :rparen
         elements << parse_expr
       end
 
-      if @pos >= @tokens.length
-        raise "Unterminated list — expected ')'"
-      end
 
-      @pos += 1 # skip ')'
+      raise "Unterminated list — expected ')'" if @pos >= @tokens.length
+
+      @pos += 1
       elements
     end
   end
 
-  # Convenience method
-  def self.parse(source)
-    Parser.new(source).parse
+  # Convenience methods — default to :strict mode
+  def self.parse(source, mode: :strict)
+    Parser.new(source, mode: mode).parse
   end
 
-  def self.parse_all(source)
-    Parser.new(source).parse_all
+  def self.parse_all(source, mode: :strict)
+    Parser.new(source, mode: mode).parse_all
   end
 
-  def self.tokenize(source)
-    Lexer.new(source).tokenize
+  def self.tokenize(source, mode: :strict)
+    Lexer.new(source, mode: mode).tokenize
   end
 end
