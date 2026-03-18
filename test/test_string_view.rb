@@ -828,9 +828,9 @@ class TestStringView < Minitest::Test
   # Frozen / bang methods
   # ---------------------------------------------------------------------------
 
-  def test_frozen
+  def test_not_frozen
     sv = StringView.new("hello")
-    assert_predicate(sv, :frozen?)
+    refute_predicate(sv, :frozen?)
   end
 
   def test_bang_methods_raise
@@ -1309,10 +1309,10 @@ class TestStringView < Minitest::Test
     assert_equal("語テ", result.to_s)
   end
 
-  def test_frozen_after_reset
+  def test_not_frozen_after_reset
     sv = StringView.new("hello")
     sv.reset!("world", 0, 5)
-    assert_predicate(sv, :frozen?)
+    refute_predicate(sv, :frozen?)
   end
 
   # ---------------------------------------------------------------------------

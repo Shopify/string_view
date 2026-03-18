@@ -218,7 +218,13 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
 
-    rb_obj_freeze(self);
+    /*
+     * We intentionally do NOT freeze self. StringView blocks content
+     * mutation via the immutable frozen backing and explicit FrozenError
+     * on bang methods. Not freezing allows reset! to work without
+     * violating Ruby's frozen? contract — libraries and Ruby itself
+     * use frozen? to assume immutability for hash keys and Ractor sharing.
+     */
 
     return self;
 }
@@ -248,10 +254,6 @@ static VALUE sv_inspect(VALUE self) {
     VALUE content = rb_enc_str_new(sv_ptr(sv), sv->length, sv_enc(sv));
     return rb_sprintf("#<StringView:%p \"%"PRIsVALUE"\" offset=%ld length=%ld>",
                       (void *)self, content, sv->offset, sv->length);
-}
-
-static VALUE sv_frozen_p(VALUE self) {
-    return Qtrue;
 }
 
 /*
@@ -1165,7 +1167,6 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "to_s",       sv_to_s,       0);
     rb_define_private_method(cStringView, "to_str", sv_to_str, 0);
     rb_define_method(cStringView, "inspect",    sv_inspect,    0);
-    rb_define_method(cStringView, "frozen?",    sv_frozen_p,   0);
     rb_define_method(cStringView, "reset!",     sv_reset,      3);
     rb_define_alias(cStringView,  "materialize", "to_s");
 

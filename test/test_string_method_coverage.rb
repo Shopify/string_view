@@ -35,7 +35,7 @@ class TestStringMethodCoverage < Minitest::Test
     :encoding,
     :end_with?,
     :eql?,
-    :frozen?,
+
     :getbyte,
     :gsub,
     :hash,
