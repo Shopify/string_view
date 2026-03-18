@@ -41,6 +41,19 @@ typedef struct {
 
 static VALUE cStringView;
 
+/* Cached method IDs — initialized once in Init_string_view */
+static ID id_index, id_rindex, id_byteindex, id_byterindex;
+static ID id_match, id_match_p, id_match_op;
+static ID id_begin, id_aref;
+static ID id_upcase, id_downcase, id_capitalize, id_swapcase;
+static ID id_strip, id_lstrip, id_rstrip;
+static ID id_chomp, id_chop, id_reverse, id_squeeze;
+static ID id_encode, id_gsub, id_sub, id_tr, id_tr_s;
+static ID id_delete, id_count, id_scan, id_split;
+static ID id_center, id_ljust, id_rjust;
+static ID id_format_op, id_plus, id_multiply;
+static ID id_unpack1, id_scrub, id_unicode_normalize;
+
 /*
  * GC callbacks.
  *
@@ -88,11 +101,12 @@ static size_t sv_memsize(const void *ptr) {
 static const rb_data_type_t string_view_type = {
     .wrap_struct_name = "StringView",
     .function = { .dmark = sv_mark, .dfree = sv_free, .dsize = sv_memsize, .dcompact = sv_compact },
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE,
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_EMBEDDABLE,
 };
 
 /* Forward declarations */
 static int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
+SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
 
 /* ========================================================================= */
 /* Internal helpers                                                          */
@@ -135,7 +149,7 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     sv->single_byte = parent->single_byte;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
-    FL_SET_RAW(obj, FL_FREEZE);
+    /* Not frozen — see sv_initialize comment for rationale */
     return obj;
 }
 
@@ -204,7 +218,13 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
 
-    rb_obj_freeze(self);
+    /*
+     * We intentionally do NOT freeze self. StringView blocks content
+     * mutation via the immutable frozen backing and explicit FrozenError
+     * on bang methods. Not freezing allows reset! to work without
+     * violating Ruby's frozen? contract — libraries and Ruby itself
+     * use frozen? to assume immutability for hash keys and Ractor sharing.
+     */
 
     return self;
 }
@@ -236,14 +256,11 @@ static VALUE sv_inspect(VALUE self) {
                       (void *)self, content, sv->offset, sv->length);
 }
 
-static VALUE sv_frozen_p(VALUE self) {
-    return Qtrue;
-}
-
 /*
  * reset!(new_backing, byte_offset, byte_length) -> self
  */
 static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlength) {
+    rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
     if (!RB_TYPE_P(new_backing, T_STRING)) {
@@ -272,7 +289,13 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv->length      = len;
     sv->single_byte = sv_compute_single_byte(new_backing, enc);
     sv->charlen     = -1;
-    sv->stride_idx  = NULL;
+
+    /* Free old stride index to avoid memory leak on reuse */
+    if (sv->stride_idx) {
+        xfree(sv->stride_idx->offsets);
+        xfree(sv->stride_idx);
+        sv->stride_idx = NULL;
+    }
 
     return self;
 }
@@ -306,6 +329,8 @@ static VALUE sv_encoding(VALUE self) {
 
 static VALUE sv_ascii_only_p(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
+    if (sv_single_byte_optimizable(sv)) return Qtrue;
+    /* single_byte resolved to 0 (multibyte) — scan to confirm non-ASCII bytes */
     const char *p = sv_ptr(sv);
     long i;
     for (i = 0; i < sv->length; i++) {
@@ -364,13 +389,13 @@ static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
 static VALUE sv_index(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("index"), argc, argv);
+    return rb_funcallv(shared, id_index, argc, argv);
 }
 
 static VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("rindex"), argc, argv);
+    return rb_funcallv(shared, id_rindex, argc, argv);
 }
 
 static VALUE sv_getbyte(VALUE self, VALUE vidx) {
@@ -384,13 +409,13 @@ static VALUE sv_getbyte(VALUE self, VALUE vidx) {
 static VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("byteindex"), argc, argv);
+    return rb_funcallv(shared, id_byteindex, argc, argv);
 }
 
 static VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("byterindex"), argc, argv);
+    return rb_funcallv(shared, id_byterindex, argc, argv);
 }
 
 /* ========================================================================= */
@@ -454,19 +479,19 @@ static VALUE sv_chars(VALUE self) {
 static VALUE sv_match(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("match"), argc, argv);
+    return rb_funcallv(shared, id_match, argc, argv);
 }
 
 static VALUE sv_match_p(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("match?"), argc, argv);
+    return rb_funcallv(shared, id_match_p, argc, argv);
 }
 
 static VALUE sv_match_operator(VALUE self, VALUE pattern) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcall(shared, rb_intern("=~"), 1, pattern);
+    return rb_funcall(shared, id_match_op, 1, pattern);
 }
 
 /* ========================================================================= */
@@ -561,6 +586,36 @@ static VALUE sv_oct(VALUE self) {
 /* Tier 1: Comparison                                                        */
 /* ========================================================================= */
 
+/*
+ * Returns 1 if all bytes in the view are < 128 (7-bit ASCII).
+ * Uses the single_byte cache when available.
+ */
+SV_INLINE int sv_is_7bit(string_view_t *sv) {
+    if (sv_single_byte_optimizable(sv)) return 1;
+    const char *p = sv_ptr(sv);
+    long i;
+    for (i = 0; i < sv->length; i++) {
+        if ((unsigned char)p[i] > 127) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Check encoding compatibility for equality, mirroring Ruby's String#==.
+ * Two encodings are compatible for comparison if:
+ *   - They are the same encoding, OR
+ *   - Both are ASCII-compatible and at least one side is 7-bit
+ *     (e.g. UTF-8 "hello" == US-ASCII "hello")
+ */
+SV_INLINE int sv_enc_compatible_for_eq(
+    rb_encoding *enc1, int is_7bit_1,
+    rb_encoding *enc2, int is_7bit_2)
+{
+    if (enc1 == enc2) return 1;
+    if (!rb_enc_asciicompat(enc1) || !rb_enc_asciicompat(enc2)) return 0;
+    return is_7bit_1 || is_7bit_2;
+}
+
 static VALUE sv_eq(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
@@ -568,6 +623,13 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     /* Fast path: String is the most common comparison target */
     if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
         if (sv->length != RSTRING_LEN(other)) return Qfalse;
+        rb_encoding *oenc = rb_enc_get(other);
+        if (sv->enc != oenc) {
+            int sv_7bit = sv_is_7bit(sv);
+            int o_7bit = rb_enc_str_asciionly_p(other);
+            if (!sv_enc_compatible_for_eq(sv->enc, sv_7bit, oenc, o_7bit))
+                return Qfalse;
+        }
         return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -575,6 +637,12 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     if (rb_obj_class(other) == cStringView) {
         string_view_t *o = sv_get_struct(other);
         if (sv->length != o->length) return Qfalse;
+        if (sv->enc != o->enc) {
+            int sv_7bit = sv_is_7bit(sv);
+            int o_7bit = sv_is_7bit(o);
+            if (!sv_enc_compatible_for_eq(sv->enc, sv_7bit, o->enc, o_7bit))
+                return Qfalse;
+        }
         return memcmp(p, sv_ptr(o), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -617,8 +685,15 @@ static VALUE sv_eql_p(VALUE self, VALUE other) {
 static VALUE sv_hash(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
+    /*
+     * Mirror CRuby's rb_str_hash: normalize encoding index to 0 for
+     * 7-bit content so that e.g. UTF-8 "hello" and US-ASCII "hello"
+     * produce the same hash (they compare equal via sv_eq).
+     */
+    int e = rb_enc_to_index(sv->enc);
+    if (e && sv_is_7bit(sv)) e = 0;
     st_index_t h = rb_memhash(p, sv->length);
-    h ^= (st_index_t)rb_enc_get_index(sv->backing);
+    h ^= (st_index_t)e;
     return ST2FIX(h);
 }
 
@@ -640,9 +715,13 @@ static int sv_compute_single_byte(VALUE backing, rb_encoding *enc) {
     if (rb_enc_mbmaxlen(enc) == 1) return 1;
     int cr = ENC_CODERANGE(backing);
     if (cr == ENC_CODERANGE_7BIT) return 1;
-    /* For VALID (known multibyte) we know it's not single-byte */
-    if (cr == ENC_CODERANGE_VALID) return 0;
-    /* UNKNOWN: we don't know yet — return -1 (will be resolved lazily) */
+    /*
+     * For VALID and UNKNOWN: the coderange reflects the entire backing
+     * string, not this slice. A view over an ASCII-only prefix of a
+     * multibyte string would incorrectly get single_byte=0 here.
+     * Return -1 (unknown) and let sv_single_byte_optimizable resolve
+     * it lazily by scanning the actual slice bytes.
+     */
     return -1;
 }
 
@@ -914,27 +993,13 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
         long total_chars = sv_char_count(sv);
         long beg, len;
-        int excl;
-        VALUE rb_beg = rb_funcall(arg1, rb_intern("begin"), 0);
-        VALUE rb_end = rb_funcall(arg1, rb_intern("end"), 0);
-        excl = RTEST(rb_funcall(arg1, rb_intern("exclude_end?"), 0));
 
-        beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
-        if (beg < 0) beg += total_chars;
-        if (beg < 0) return Qnil;
-
-        long e;
-        if (NIL_P(rb_end)) {
-            e = total_chars;
-        } else {
-            e = NUM2LONG(rb_end);
-            if (e < 0) e += total_chars;
-            if (!excl) e += 1;
+        /* rb_range_beg_len resolves negative indices and clamps to total,
+         * replacing 3 Ruby method dispatches with a single C call. */
+        switch (rb_range_beg_len(arg1, &beg, &len, total_chars, 1)) {
+        case Qfalse: return Qnil;
+        case Qnil:   return Qnil;
         }
-        if (e < beg) e = beg;
-        len = e - beg;
-        if (beg > total_chars) return Qnil;
-        if (beg + len > total_chars) len = total_chars - beg;
 
         long byte_off = sv_char_to_byte_offset(sv, beg);
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
@@ -946,11 +1011,11 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
     if (rb_obj_is_kind_of(arg1, rb_cRegexp)) {
         VALUE shared = sv_as_shared_str(sv);
-        VALUE m = rb_funcall(arg1, rb_intern("match"), 1, shared);
+        VALUE m = rb_funcall(arg1, id_match, 1, shared);
         if (NIL_P(m)) return Qnil;
 
-        VALUE matched = rb_funcall(m, rb_intern("[]"), 1, INT2FIX(0));
-        long match_beg = NUM2LONG(rb_funcall(m, rb_intern("begin"), 1, INT2FIX(0)));
+        VALUE matched = rb_funcall(m, id_aref, 1, INT2FIX(0));
+        long match_beg = NUM2LONG(rb_funcall(m, id_begin, 1, INT2FIX(0)));
 
         long byte_off = sv_char_to_byte_offset(sv, match_beg);
         long byte_len = RSTRING_LEN(matched);
@@ -1020,26 +1085,11 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
 
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
         long beg, len;
-        VALUE rb_beg = rb_funcall(arg1, rb_intern("begin"), 0);
-        VALUE rb_end = rb_funcall(arg1, rb_intern("end"), 0);
-        int excl = RTEST(rb_funcall(arg1, rb_intern("exclude_end?"), 0));
 
-        beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
-        if (beg < 0) beg += sv->length;
-        if (beg < 0) return Qnil;
-
-        long e;
-        if (NIL_P(rb_end)) {
-            e = sv->length;
-        } else {
-            e = NUM2LONG(rb_end);
-            if (e < 0) e += sv->length;
-            if (!excl) e += 1;
+        switch (rb_range_beg_len(arg1, &beg, &len, sv->length, 1)) {
+        case Qfalse: return Qnil;
+        case Qnil:   return Qnil;
         }
-        if (e < beg) e = beg;
-        len = e - beg;
-        if (beg > sv->length) return Qnil;
-        if (beg + len > sv->length) len = sv->length - beg;
 
         return sv_new_from_parent(sv, sv->offset + beg, len);
     }
@@ -1056,55 +1106,54 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
 /* Tier 3: Transform delegation                                              */
 /* ========================================================================= */
 
-#define SV_DELEGATE_FUNCALL(cname, rbname)                              \
+#define SV_DELEGATE_FUNCALL(cname, cached_id)                           \
     static VALUE sv_##cname(int argc, VALUE *argv, VALUE self) {        \
         string_view_t *sv = sv_get_struct(self);                        \
         VALUE shared = sv_as_shared_str(sv);                            \
         if (rb_block_given_p()) {                                       \
-            return rb_funcall_with_block(shared, rb_intern(rbname),     \
+            return rb_funcall_with_block(shared, cached_id,             \
                                          argc, argv, rb_block_proc()); \
         }                                                               \
-        return rb_funcallv(shared, rb_intern(rbname), argc, argv);      \
+        return rb_funcallv(shared, cached_id, argc, argv);              \
     }
 
-SV_DELEGATE_FUNCALL(upcase,    "upcase")
-SV_DELEGATE_FUNCALL(downcase,  "downcase")
-SV_DELEGATE_FUNCALL(capitalize,"capitalize")
-SV_DELEGATE_FUNCALL(swapcase,  "swapcase")
-SV_DELEGATE_FUNCALL(strip,     "strip")
-SV_DELEGATE_FUNCALL(lstrip,    "lstrip")
-SV_DELEGATE_FUNCALL(rstrip,    "rstrip")
-SV_DELEGATE_FUNCALL(chomp,     "chomp")
-SV_DELEGATE_FUNCALL(chop,      "chop")
-SV_DELEGATE_FUNCALL(reverse,   "reverse")
-SV_DELEGATE_FUNCALL(squeeze,   "squeeze")
-SV_DELEGATE_FUNCALL(encode,    "encode")
-SV_DELEGATE_FUNCALL(gsub,      "gsub")
-SV_DELEGATE_FUNCALL(sub,       "sub")
-SV_DELEGATE_FUNCALL(tr,        "tr")
-SV_DELEGATE_FUNCALL(tr_s,      "tr_s")
-SV_DELEGATE_FUNCALL(sv_delete, "delete")
-SV_DELEGATE_FUNCALL(count,     "count")
-SV_DELEGATE_FUNCALL(scan,      "scan")
-SV_DELEGATE_FUNCALL(split,     "split")
-SV_DELEGATE_FUNCALL(center,    "center")
-SV_DELEGATE_FUNCALL(ljust,     "ljust")
-SV_DELEGATE_FUNCALL(rjust,     "rjust")
-SV_DELEGATE_FUNCALL(format_op, "%")
-SV_DELEGATE_FUNCALL(plus,      "+")
-SV_DELEGATE_FUNCALL(multiply,  "*")
-SV_DELEGATE_FUNCALL(unpack1,   "unpack1")
-SV_DELEGATE_FUNCALL(scrub,     "scrub")
-SV_DELEGATE_FUNCALL(unicode_normalize, "unicode_normalize")
+SV_DELEGATE_FUNCALL(upcase,    id_upcase)
+SV_DELEGATE_FUNCALL(downcase,  id_downcase)
+SV_DELEGATE_FUNCALL(capitalize,id_capitalize)
+SV_DELEGATE_FUNCALL(swapcase,  id_swapcase)
+SV_DELEGATE_FUNCALL(strip,     id_strip)
+SV_DELEGATE_FUNCALL(lstrip,    id_lstrip)
+SV_DELEGATE_FUNCALL(rstrip,    id_rstrip)
+SV_DELEGATE_FUNCALL(chomp,     id_chomp)
+SV_DELEGATE_FUNCALL(chop,      id_chop)
+SV_DELEGATE_FUNCALL(reverse,   id_reverse)
+SV_DELEGATE_FUNCALL(squeeze,   id_squeeze)
+SV_DELEGATE_FUNCALL(encode,    id_encode)
+SV_DELEGATE_FUNCALL(gsub,      id_gsub)
+SV_DELEGATE_FUNCALL(sub,       id_sub)
+SV_DELEGATE_FUNCALL(tr,        id_tr)
+SV_DELEGATE_FUNCALL(tr_s,      id_tr_s)
+SV_DELEGATE_FUNCALL(delete_str,id_delete)
+SV_DELEGATE_FUNCALL(count,     id_count)
+SV_DELEGATE_FUNCALL(scan,      id_scan)
+SV_DELEGATE_FUNCALL(split,     id_split)
+SV_DELEGATE_FUNCALL(center,    id_center)
+SV_DELEGATE_FUNCALL(ljust,     id_ljust)
+SV_DELEGATE_FUNCALL(rjust,     id_rjust)
+SV_DELEGATE_FUNCALL(format_op, id_format_op)
+SV_DELEGATE_FUNCALL(plus,      id_plus)
+SV_DELEGATE_FUNCALL(multiply,  id_multiply)
+SV_DELEGATE_FUNCALL(unpack1,   id_unpack1)
+SV_DELEGATE_FUNCALL(scrub,     id_scrub)
+SV_DELEGATE_FUNCALL(unicode_normalize, id_unicode_normalize)
 
 /* ========================================================================= */
 /* Bang methods — always raise FrozenError                                   */
 /* ========================================================================= */
 
 static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
-    VALUE str = sv_to_s(self);
-    rb_raise(rb_eFrozenError, "can't modify frozen StringView: \"%s\"",
-             StringValueCStr(str));
+    (void)argc; (void)argv;
+    rb_raise(rb_eFrozenError, "can't modify frozen StringView");
     return Qnil;
 }
 
@@ -1115,6 +1164,46 @@ static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
 void Init_string_view(void) {
     enc_utf8 = rb_utf8_encoding();
 
+    /* Cache method IDs — avoids rb_intern hash lookup on every call */
+    id_index       = rb_intern("index");
+    id_rindex      = rb_intern("rindex");
+    id_byteindex   = rb_intern("byteindex");
+    id_byterindex  = rb_intern("byterindex");
+    id_match       = rb_intern("match");
+    id_match_p     = rb_intern("match?");
+    id_match_op    = rb_intern("=~");
+    id_begin       = rb_intern("begin");
+    id_aref        = rb_intern("[]");
+    id_upcase      = rb_intern("upcase");
+    id_downcase    = rb_intern("downcase");
+    id_capitalize  = rb_intern("capitalize");
+    id_swapcase    = rb_intern("swapcase");
+    id_strip       = rb_intern("strip");
+    id_lstrip      = rb_intern("lstrip");
+    id_rstrip      = rb_intern("rstrip");
+    id_chomp       = rb_intern("chomp");
+    id_chop        = rb_intern("chop");
+    id_reverse     = rb_intern("reverse");
+    id_squeeze     = rb_intern("squeeze");
+    id_encode      = rb_intern("encode");
+    id_gsub        = rb_intern("gsub");
+    id_sub         = rb_intern("sub");
+    id_tr          = rb_intern("tr");
+    id_tr_s        = rb_intern("tr_s");
+    id_delete      = rb_intern("delete");
+    id_count       = rb_intern("count");
+    id_scan        = rb_intern("scan");
+    id_split       = rb_intern("split");
+    id_center      = rb_intern("center");
+    id_ljust       = rb_intern("ljust");
+    id_rjust       = rb_intern("rjust");
+    id_format_op   = rb_intern("%");
+    id_plus        = rb_intern("+");
+    id_multiply    = rb_intern("*");
+    id_unpack1     = rb_intern("unpack1");
+    id_scrub       = rb_intern("scrub");
+    id_unicode_normalize = rb_intern("unicode_normalize");
+
     cStringView = rb_define_class("StringView", rb_cObject);
     rb_include_module(cStringView, rb_mComparable);
 
@@ -1124,7 +1213,6 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "to_s",       sv_to_s,       0);
     rb_define_private_method(cStringView, "to_str", sv_to_str, 0);
     rb_define_method(cStringView, "inspect",    sv_inspect,    0);
-    rb_define_method(cStringView, "frozen?",    sv_frozen_p,   0);
     rb_define_method(cStringView, "reset!",     sv_reset,      3);
     rb_define_alias(cStringView,  "materialize", "to_s");
 
@@ -1183,7 +1271,7 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "sub",         sv_sub,        -1);
     rb_define_method(cStringView, "tr",          sv_tr,         -1);
     rb_define_method(cStringView, "tr_s",        sv_tr_s,       -1);
-    rb_define_method(cStringView, "delete",      sv_sv_delete,  -1);
+    rb_define_method(cStringView, "delete",      sv_delete_str, -1);
     rb_define_method(cStringView, "count",       sv_count,      -1);
     rb_define_method(cStringView, "scan",        sv_scan,       -1);
     rb_define_method(cStringView, "split",       sv_split,      -1);
