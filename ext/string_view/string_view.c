@@ -942,27 +942,13 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
         long total_chars = sv_char_count(sv);
         long beg, len;
-        int excl;
-        VALUE rb_beg = rb_funcall(arg1, id_begin, 0);
-        VALUE rb_end = rb_funcall(arg1, id_end, 0);
-        excl = RTEST(rb_funcall(arg1, id_exclude_end_p, 0));
 
-        beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
-        if (beg < 0) beg += total_chars;
-        if (beg < 0) return Qnil;
-
-        long e;
-        if (NIL_P(rb_end)) {
-            e = total_chars;
-        } else {
-            e = NUM2LONG(rb_end);
-            if (e < 0) e += total_chars;
-            if (!excl) e += 1;
+        /* rb_range_beg_len resolves negative indices and clamps to total,
+         * replacing 3 Ruby method dispatches with a single C call. */
+        switch (rb_range_beg_len(arg1, &beg, &len, total_chars, 1)) {
+        case Qfalse: return Qnil;
+        case Qnil:   return Qnil;
         }
-        if (e < beg) e = beg;
-        len = e - beg;
-        if (beg > total_chars) return Qnil;
-        if (beg + len > total_chars) len = total_chars - beg;
 
         long byte_off = sv_char_to_byte_offset(sv, beg);
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
@@ -1048,26 +1034,11 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
 
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
         long beg, len;
-        VALUE rb_beg = rb_funcall(arg1, id_begin, 0);
-        VALUE rb_end = rb_funcall(arg1, id_end, 0);
-        int excl = RTEST(rb_funcall(arg1, id_exclude_end_p, 0));
 
-        beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
-        if (beg < 0) beg += sv->length;
-        if (beg < 0) return Qnil;
-
-        long e;
-        if (NIL_P(rb_end)) {
-            e = sv->length;
-        } else {
-            e = NUM2LONG(rb_end);
-            if (e < 0) e += sv->length;
-            if (!excl) e += 1;
+        switch (rb_range_beg_len(arg1, &beg, &len, sv->length, 1)) {
+        case Qfalse: return Qnil;
+        case Qnil:   return Qnil;
         }
-        if (e < beg) e = beg;
-        len = e - beg;
-        if (beg > sv->length) return Qnil;
-        if (beg + len > sv->length) len = sv->length - beg;
 
         return sv_new_from_parent(sv, sv->offset + beg, len);
     }
