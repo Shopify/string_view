@@ -44,7 +44,7 @@ static VALUE cStringView;
 /* Cached method IDs — initialized once in Init_string_view */
 static ID id_index, id_rindex, id_byteindex, id_byterindex;
 static ID id_match, id_match_p, id_match_op;
-static ID id_begin, id_end, id_exclude_end_p, id_aref;
+static ID id_begin, id_aref;
 static ID id_upcase, id_downcase, id_capitalize, id_swapcase;
 static ID id_strip, id_lstrip, id_rstrip;
 static ID id_chomp, id_chop, id_reverse, id_squeeze;
@@ -1124,8 +1124,6 @@ void Init_string_view(void) {
     id_match_p     = rb_intern("match?");
     id_match_op    = rb_intern("=~");
     id_begin       = rb_intern("begin");
-    id_end         = rb_intern("end");
-    id_exclude_end_p = rb_intern("exclude_end?");
     id_aref        = rb_intern("[]");
     id_upcase      = rb_intern("upcase");
     id_downcase    = rb_intern("downcase");
