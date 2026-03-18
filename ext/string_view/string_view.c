@@ -101,7 +101,7 @@ static size_t sv_memsize(const void *ptr) {
 static const rb_data_type_t string_view_type = {
     .wrap_struct_name = "StringView",
     .function = { .dmark = sv_mark, .dfree = sv_free, .dsize = sv_memsize, .dcompact = sv_compact },
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE | RUBY_TYPED_EMBEDDABLE,
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_EMBEDDABLE,
 };
 
 /* Forward declarations */
