@@ -574,6 +574,7 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     /* Fast path: String is the most common comparison target */
     if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
         if (sv->length != RSTRING_LEN(other)) return Qfalse;
+        if (rb_enc_get_index(sv->backing) != rb_enc_get_index(other)) return Qfalse;
         return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -581,6 +582,7 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     if (rb_obj_class(other) == cStringView) {
         string_view_t *o = sv_get_struct(other);
         if (sv->length != o->length) return Qfalse;
+        if (sv->enc != o->enc) return Qfalse;
         return memcmp(p, sv_ptr(o), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -624,7 +626,7 @@ static VALUE sv_hash(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
     st_index_t h = rb_memhash(p, sv->length);
-    h ^= (st_index_t)rb_enc_get_index(sv->backing);
+    h ^= (st_index_t)rb_enc_to_index(sv->enc);
     return ST2FIX(h);
 }
 
