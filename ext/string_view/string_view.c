@@ -651,9 +651,13 @@ static int sv_compute_single_byte(VALUE backing, rb_encoding *enc) {
     if (rb_enc_mbmaxlen(enc) == 1) return 1;
     int cr = ENC_CODERANGE(backing);
     if (cr == ENC_CODERANGE_7BIT) return 1;
-    /* For VALID (known multibyte) we know it's not single-byte */
-    if (cr == ENC_CODERANGE_VALID) return 0;
-    /* UNKNOWN: we don't know yet — return -1 (will be resolved lazily) */
+    /*
+     * For VALID and UNKNOWN: the coderange reflects the entire backing
+     * string, not this slice. A view over an ASCII-only prefix of a
+     * multibyte string would incorrectly get single_byte=0 here.
+     * Return -1 (unknown) and let sv_single_byte_optimizable resolve
+     * it lazily by scanning the actual slice bytes.
+     */
     return -1;
 }
 
