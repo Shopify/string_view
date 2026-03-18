@@ -32,6 +32,33 @@ class TestAllocations < Minitest::Test
     @sv.hash
     @sv[0, 1]
     @sv.byteslice(0, 1)
+
+    # Warm up new zero-copy methods
+    @sv.strip
+    @sv.lstrip
+    @sv.rstrip
+    @sv.chomp
+    @sv.chop
+    @sv.delete_prefix("Hello")
+    @sv.delete_suffix("world")
+    @sv.chr
+    @sv.ord
+    @sv.valid_encoding?
+
+    # Warm up versions that actually trim
+    @sv_with_ws = StringView.new("  hello  ")
+    @sv_with_ws.strip
+    @sv_with_ws.lstrip
+    @sv_with_ws.rstrip
+
+    @sv_with_nl = StringView.new("hello\n")
+    @sv_with_nl.chomp
+    @sv_with_nl.chop
+
+    @sv_prefixed = StringView.new("Hello, world!")
+    @sv_prefixed.delete_prefix("Hello")
+    @sv_prefixed.delete_suffix("world!")
+    @sv_prefixed.chr
   end
 
   # -------------------------------------------------------------------
@@ -104,6 +131,30 @@ class TestAllocations < Minitest::Test
     assert_allocations(0) { @sv.hash }
   end
 
+  def test_index_string_zero_alloc
+    sv = StringView.new("hello world")
+    sv.index("world") # warm
+    assert_allocations(0) { sv.index("world") }
+  end
+
+  def test_rindex_string_zero_alloc
+    sv = StringView.new("hello hello")
+    sv.rindex("hello") # warm
+    assert_allocations(0) { sv.rindex("hello") }
+  end
+
+  def test_byteindex_string_zero_alloc
+    sv = StringView.new("hello world")
+    sv.byteindex("world") # warm
+    assert_allocations(0) { sv.byteindex("world") }
+  end
+
+  def test_byterindex_string_zero_alloc
+    sv = StringView.new("hello hello")
+    sv.byterindex("hello") # warm
+    assert_allocations(0) { sv.byterindex("hello") }
+  end
+
   def test_to_i_zero_alloc
     sv = StringView.new("12345xxxxxx", 0, 5)
     sv.to_i # warm
@@ -132,6 +183,144 @@ class TestAllocations < Minitest::Test
     sv = StringView.new("77xxxxxx", 0, 2)
     sv.oct # warm
     assert_allocations(0) { sv.oct }
+  end
+
+  # -------------------------------------------------------------------
+  # Tier 1: Zero-copy reads — new methods (ord, valid_encoding?, chr)
+  # -------------------------------------------------------------------
+
+  def test_ord_zero_alloc
+    assert_allocations(0) { @sv.ord }
+  end
+
+  def test_valid_encoding_zero_alloc
+    assert_allocations(0) { @sv.valid_encoding? }
+  end
+
+  # -------------------------------------------------------------------
+  # Tier 1.5: Zero-copy transforms — returns self when no change needed
+  # (0 allocations when content is unchanged)
+  # -------------------------------------------------------------------
+
+  def test_strip_no_change_zero_alloc
+    # Use a string with no leading/trailing whitespace → returns self, 0 alloc
+    sv = StringView.new("hello")
+    sv.strip # warm
+    assert_allocations(0) { sv.strip }
+  end
+
+  def test_lstrip_no_change_zero_alloc
+    sv = StringView.new("hello")
+    sv.lstrip # warm
+    assert_allocations(0) { sv.lstrip }
+  end
+
+  def test_rstrip_no_change_zero_alloc
+    sv = StringView.new("hello")
+    sv.rstrip # warm
+    assert_allocations(0) { sv.rstrip }
+  end
+
+  def test_chomp_no_change_zero_alloc
+    # @sv doesn't end with \n → returns self
+    sv = StringView.new("hello")
+    sv.chomp # warm
+    assert_allocations(0) { sv.chomp }
+  end
+
+  def test_chop_empty_zero_alloc
+    sv = StringView.new("")
+    sv.chop # warm
+    assert_allocations(0) { sv.chop }
+  end
+
+  def test_delete_prefix_no_match_zero_alloc
+    assert_allocations(0) { @sv.delete_prefix("NOPE") }
+  end
+
+  def test_delete_suffix_no_match_zero_alloc
+    assert_allocations(0) { @sv.delete_suffix("NOPE") }
+  end
+
+  # -------------------------------------------------------------------
+  # Tier 1.5: Zero-copy transforms — returns new StringView (1 alloc)
+  # when content is trimmed. ZERO string allocations.
+  # -------------------------------------------------------------------
+
+  def test_strip_with_change_one_alloc
+    assert_allocations(1) { @sv_with_ws.strip }
+  end
+
+  def test_lstrip_with_change_one_alloc
+    assert_allocations(1) { @sv_with_ws.lstrip }
+  end
+
+  def test_rstrip_with_change_one_alloc
+    assert_allocations(1) { @sv_with_ws.rstrip }
+  end
+
+  def test_chomp_with_change_one_alloc
+    assert_allocations(1) { @sv_with_nl.chomp }
+  end
+
+  def test_chop_one_alloc
+    assert_allocations(1) { @sv_with_nl.chop }
+  end
+
+  def test_delete_prefix_match_one_alloc
+    assert_allocations(1) { @sv_prefixed.delete_prefix("Hello") }
+  end
+
+  def test_delete_suffix_match_one_alloc
+    assert_allocations(1) { @sv_prefixed.delete_suffix("world!") }
+  end
+
+  def test_chr_one_alloc
+    assert_allocations(1) { @sv_prefixed.chr }
+  end
+
+  # -------------------------------------------------------------------
+  # Verify strip/lstrip/rstrip return StringView, not String
+  # -------------------------------------------------------------------
+
+  def test_strip_returns_string_view
+    result = @sv_with_ws.strip
+    assert_instance_of(StringView, result)
+  end
+
+  def test_lstrip_returns_string_view
+    result = @sv_with_ws.lstrip
+    assert_instance_of(StringView, result)
+  end
+
+  def test_rstrip_returns_string_view
+    result = @sv_with_ws.rstrip
+    assert_instance_of(StringView, result)
+  end
+
+  def test_chomp_returns_string_view
+    result = @sv_with_nl.chomp
+    assert_instance_of(StringView, result)
+  end
+
+  def test_chop_returns_string_view
+    result = @sv_with_nl.chop
+    assert_instance_of(StringView, result)
+  end
+
+  def test_delete_prefix_returns_string_view
+    result = @sv_prefixed.delete_prefix("Hello")
+    assert_instance_of(StringView, result)
+  end
+
+  def test_delete_suffix_returns_string_view
+    result = @sv_prefixed.delete_suffix("world!")
+    assert_instance_of(StringView, result)
+  end
+
+  def test_chr_returns_string_view
+    result = @sv_prefixed.chr
+    assert_instance_of(StringView, result)
   end
 
   # -------------------------------------------------------------------
@@ -212,10 +401,11 @@ class TestAllocations < Minitest::Test
     assert_max_allocations(2) { sv.downcase }
   end
 
-  def test_strip_one_alloc
+  def test_strip_via_zero_copy_one_alloc
     sv = StringView.new("  hello  ")
     sv.strip # warm
-    assert_max_allocations(2) { sv.strip }
+    # strip now returns StringView (1 alloc), not String via delegation (2 alloc)
+    assert_allocations(1) { sv.strip }
   end
 
   def test_split_allocates_array_plus_strings

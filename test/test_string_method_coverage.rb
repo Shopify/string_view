@@ -25,8 +25,11 @@ class TestStringMethodCoverage < Minitest::Test
     :chars,
     :chomp,
     :chop,
+    :chr,
     :count,
     :delete,
+    :delete_prefix,
+    :delete_suffix,
     :downcase,
     :each_byte,
     :each_char,
@@ -48,6 +51,7 @@ class TestStringMethodCoverage < Minitest::Test
     :match,
     :match?,
     :oct,
+    :ord,
     :reverse,
     :rindex,
     :rjust,
@@ -70,6 +74,7 @@ class TestStringMethodCoverage < Minitest::Test
     :unicode_normalize,
     :unpack1,
     :upcase,
+    :valid_encoding?,
   ].freeze
 
   # These are registered as methods on StringView (via rb_define_method)
@@ -96,6 +101,8 @@ class TestStringMethodCoverage < Minitest::Test
     :chomp!,
     :chop!,
     :delete!,
+    :delete_prefix!,
+    :delete_suffix!,
     :downcase!,
     :gsub!,
     :lstrip!,
@@ -128,16 +135,11 @@ class TestStringMethodCoverage < Minitest::Test
     :bytesplice,
     :casecmp,
     :casecmp?,
-    :chr,
     :clear,
     :codepoints,
     :concat,
     :crypt,
     :dedup,
-    :delete_prefix,
-    :delete_prefix!,
-    :delete_suffix,
-    :delete_suffix!,
     :dump,
     :each_codepoint,
     :each_grapheme_cluster,
@@ -150,7 +152,6 @@ class TestStringMethodCoverage < Minitest::Test
     :lines,
     :next,
     :next!,
-    :ord,
     :partition,
     :prepend,
     :rpartition,
@@ -169,7 +170,6 @@ class TestStringMethodCoverage < Minitest::Test
     :unicode_normalized?,
     :unpack,
     :upto,
-    :valid_encoding?,
   ].freeze
 
   # -------------------------------------------------------------------
@@ -245,7 +245,7 @@ class TestStringMethodCoverage < Minitest::Test
           sv.public_send(method, "o", "0")
         when :chomp!
           sv.public_send(method, "\n")
-        when :delete!
+        when :delete!, :delete_prefix!, :delete_suffix!
           sv.public_send(method, "l")
         when :squeeze!
           sv.public_send(method)
