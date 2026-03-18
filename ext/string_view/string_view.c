@@ -585,6 +585,36 @@ static VALUE sv_oct(VALUE self) {
 /* Tier 1: Comparison                                                        */
 /* ========================================================================= */
 
+/*
+ * Returns 1 if all bytes in the view are < 128 (7-bit ASCII).
+ * Uses the single_byte cache when available.
+ */
+SV_INLINE int sv_is_7bit(string_view_t *sv) {
+    if (sv_single_byte_optimizable(sv)) return 1;
+    const char *p = sv_ptr(sv);
+    long i;
+    for (i = 0; i < sv->length; i++) {
+        if ((unsigned char)p[i] > 127) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Check encoding compatibility for equality, mirroring Ruby's String#==.
+ * Two encodings are compatible for comparison if:
+ *   - They are the same encoding, OR
+ *   - Both are ASCII-compatible and at least one side is 7-bit
+ *     (e.g. UTF-8 "hello" == US-ASCII "hello")
+ */
+SV_INLINE int sv_enc_compatible_for_eq(
+    rb_encoding *enc1, int is_7bit_1,
+    rb_encoding *enc2, int is_7bit_2)
+{
+    if (enc1 == enc2) return 1;
+    if (!rb_enc_asciicompat(enc1) || !rb_enc_asciicompat(enc2)) return 0;
+    return is_7bit_1 || is_7bit_2;
+}
+
 static VALUE sv_eq(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
@@ -592,7 +622,13 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     /* Fast path: String is the most common comparison target */
     if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
         if (sv->length != RSTRING_LEN(other)) return Qfalse;
-        if (rb_enc_get_index(sv->backing) != rb_enc_get_index(other)) return Qfalse;
+        rb_encoding *oenc = rb_enc_get(other);
+        if (sv->enc != oenc) {
+            int sv_7bit = sv_is_7bit(sv);
+            int o_7bit = rb_enc_str_asciionly_p(other);
+            if (!sv_enc_compatible_for_eq(sv->enc, sv_7bit, oenc, o_7bit))
+                return Qfalse;
+        }
         return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -600,7 +636,12 @@ static VALUE sv_eq(VALUE self, VALUE other) {
     if (rb_obj_class(other) == cStringView) {
         string_view_t *o = sv_get_struct(other);
         if (sv->length != o->length) return Qfalse;
-        if (sv->enc != o->enc) return Qfalse;
+        if (sv->enc != o->enc) {
+            int sv_7bit = sv_is_7bit(sv);
+            int o_7bit = sv_is_7bit(o);
+            if (!sv_enc_compatible_for_eq(sv->enc, sv_7bit, o->enc, o_7bit))
+                return Qfalse;
+        }
         return memcmp(p, sv_ptr(o), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
@@ -643,8 +684,15 @@ static VALUE sv_eql_p(VALUE self, VALUE other) {
 static VALUE sv_hash(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
+    /*
+     * Mirror CRuby's rb_str_hash: normalize encoding index to 0 for
+     * 7-bit content so that e.g. UTF-8 "hello" and US-ASCII "hello"
+     * produce the same hash (they compare equal via sv_eq).
+     */
+    int e = rb_enc_to_index(sv->enc);
+    if (e && sv_is_7bit(sv)) e = 0;
     st_index_t h = rb_memhash(p, sv->length);
-    h ^= (st_index_t)rb_enc_to_index(sv->enc);
+    h ^= (st_index_t)e;
     return ST2FIX(h);
 }
 
