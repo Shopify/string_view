@@ -272,7 +272,13 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv->length      = len;
     sv->single_byte = sv_compute_single_byte(new_backing, enc);
     sv->charlen     = -1;
-    sv->stride_idx  = NULL;
+
+    /* Free old stride index to avoid memory leak on reuse */
+    if (sv->stride_idx) {
+        xfree(sv->stride_idx->offsets);
+        xfree(sv->stride_idx);
+        sv->stride_idx = NULL;
+    }
 
     return self;
 }
