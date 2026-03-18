@@ -260,6 +260,7 @@ static VALUE sv_inspect(VALUE self) {
  * reset!(new_backing, byte_offset, byte_length) -> self
  */
 static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlength) {
+    rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
     if (!RB_TYPE_P(new_backing, T_STRING)) {

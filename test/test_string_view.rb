@@ -1315,6 +1315,12 @@ class TestStringView < Minitest::Test
     refute_predicate(sv, :frozen?)
   end
 
+  def test_reset_raises_on_frozen_view
+    sv = StringView.new("hello")
+    sv.freeze
+    assert_raises(FrozenError) { sv.reset!("world", 0, 5) }
+  end
+
   # ---------------------------------------------------------------------------
   # Iteration edge cases
   # ---------------------------------------------------------------------------
