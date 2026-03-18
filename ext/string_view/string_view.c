@@ -114,6 +114,26 @@ SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
 SV_INLINE int sv_is_utf8(string_view_t *sv);
 static long sv_utf8_char_count(const char *p, long len);
 
+/* Validate that str is a T_STRING, raise TypeError otherwise. */
+SV_INLINE void sv_check_string(VALUE str) {
+    if (SV_UNLIKELY(!RB_TYPE_P(str, T_STRING))) {
+        rb_raise(rb_eTypeError,
+                 "no implicit conversion of %s into String",
+                 rb_obj_classname(str));
+    }
+}
+
+/* Validate byte offset + length against a backing string's bytesize.
+ * Uses overflow-safe comparison (checks off > max before subtracting). */
+SV_INLINE void sv_check_bounds(long off, long len, long backing_len) {
+    if (SV_UNLIKELY(off < 0 || len < 0 || off > backing_len ||
+                     len > backing_len - off)) {
+        rb_raise(rb_eArgError,
+                 "offset %ld, length %ld out of range for string of bytesize %ld",
+                 off, len, backing_len);
+    }
+}
+
 /*
  * Initialize (or reinitialize) a string_view_t's fields from a frozen backing
  * string. Caller is responsible for freeing any prior stride_idx.
@@ -215,13 +235,7 @@ static void pool_grow(sv_pool_t *pool, VALUE pool_obj) {
  */
 static VALUE pool_initialize(VALUE self, VALUE str) {
     sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-
-    if (!RB_TYPE_P(str, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(str));
-    }
-
+    sv_check_string(str);
     rb_str_freeze(str);
 
     RB_OBJ_WRITE(self, &pool->backing, str);
@@ -266,12 +280,7 @@ static VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
     long off = NUM2LONG(voffset);
     long len = NUM2LONG(vlength);
 
-    if (SV_UNLIKELY(off < 0 || len < 0 || off > pool->backing_len ||
-                     len > pool->backing_len - off)) {
-        rb_raise(rb_eArgError,
-                 "offset %ld, length %ld out of range for string of bytesize %ld",
-                 off, len, pool->backing_len);
-    }
+    sv_check_bounds(off, len, pool->backing_len);
 
     /* Grow if exhausted */
     if (SV_UNLIKELY(pool->next_idx >= pool->capacity)) {
@@ -405,12 +414,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
 
     rb_scan_args(argc, argv, "12", &str, &voffset, &vlength);
 
-    if (!RB_TYPE_P(str, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(str));
-    }
-
+    sv_check_string(str);
     rb_str_freeze(str);
 
     long backing_len = RSTRING_LEN(str);
@@ -421,13 +425,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     } else {
         offset = NUM2LONG(voffset);
         length = NUM2LONG(vlength);
-
-        if (offset < 0 || length < 0 || offset > backing_len ||
-            length > backing_len - offset) {
-            rb_raise(rb_eArgError,
-                     "offset %ld, length %ld out of range for string of bytesize %ld",
-                     offset, length, backing_len);
-        }
+        sv_check_bounds(offset, length, backing_len);
     }
 
     string_view_t *sv = sv_get_struct(self);
@@ -479,24 +477,12 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
-    if (!RB_TYPE_P(new_backing, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(new_backing));
-    }
-
+    sv_check_string(new_backing);
     rb_str_freeze(new_backing);
 
     long off = NUM2LONG(voffset);
     long len = NUM2LONG(vlength);
-    long backing_len = RSTRING_LEN(new_backing);
-
-    if (off < 0 || len < 0 || off > backing_len ||
-        len > backing_len - off) {
-        rb_raise(rb_eArgError,
-                 "offset %ld, length %ld out of range for string of bytesize %ld",
-                 off, len, backing_len);
-    }
+    sv_check_bounds(off, len, RSTRING_LEN(new_backing));
 
     /* Free old stride index before reinitializing */
     if (sv->stride_idx) {
@@ -1882,41 +1868,21 @@ static VALUE sv_would_allocate(int argc, VALUE *argv, VALUE self) {
  * Strict versions of index/rindex/byteindex/byterindex:
  * String args work zero-alloc. Regexp args raise WouldAllocate.
  */
-static VALUE sv_strict_index(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#index with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
+#define SV_STRICT_SEARCH(cname, method_str, base_fn)                        \
+    static VALUE sv_strict_##cname(int argc, VALUE *argv, VALUE self) {     \
+        if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {         \
+            rb_raise(eWouldAllocate,                                        \
+                     "StringView::Strict#" method_str " with Regexp would " \
+                     "allocate a String — call .materialize to get a "      \
+                     "String, or .reset! to repoint the view");             \
+        }                                                                   \
+        return base_fn(argc, argv, self);                                   \
     }
-    return sv_index(argc, argv, self);
-}
 
-static VALUE sv_strict_rindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#rindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_rindex(argc, argv, self);
-}
-
-static VALUE sv_strict_byteindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#byteindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_byteindex(argc, argv, self);
-}
-
-static VALUE sv_strict_byterindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#byterindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_byterindex(argc, argv, self);
-}
+SV_STRICT_SEARCH(index,      "index",      sv_index)
+SV_STRICT_SEARCH(rindex,     "rindex",     sv_rindex)
+SV_STRICT_SEARCH(byteindex,  "byteindex",  sv_byteindex)
+SV_STRICT_SEARCH(byterindex, "byterindex", sv_byterindex)
 
 /* ========================================================================= */
 /* Init                                                                      */
