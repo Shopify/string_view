@@ -40,6 +40,8 @@ typedef struct {
 } string_view_t;
 
 static VALUE cStringView;
+static VALUE cStringViewStrict;
+static VALUE eWouldAllocate;
 
 /* Cached method IDs — initialized once in Init_string_view */
 static ID id_index, id_rindex, id_byteindex, id_byterindex;
@@ -106,7 +108,11 @@ static const rb_data_type_t string_view_type = {
 
 /* Forward declarations */
 static int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
+static long sv_char_count(string_view_t *sv);
+static long sv_char_to_byte_offset(string_view_t *sv, long char_idx);
 SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
+SV_INLINE int sv_is_utf8(string_view_t *sv);
+static long sv_utf8_char_count(const char *p, long len);
 
 /* ========================================================================= */
 /* Internal helpers                                                          */
@@ -136,10 +142,12 @@ static VALUE sv_as_shared_str(string_view_t *sv) {
     return shared;
 }
 
-/* Allocate a new StringView from a parent that already has cached base/enc */
-SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long length) {
+/* Allocate a new StringView from a parent that already has cached base/enc.
+ * Preserves the class of parent_obj (StringView or StringView::Strict). */
+SV_INLINE VALUE sv_new_from_parent_obj(VALUE parent_obj, string_view_t *parent, long offset, long length) {
     string_view_t *sv;
-    VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
+    VALUE klass = rb_obj_class(parent_obj);
+    VALUE obj = TypedData_Make_Struct(klass, string_view_t,
                                      &string_view_type, sv);
     RB_OBJ_WRITE(obj, &sv->backing, parent->backing);
     sv->base        = parent->base;
@@ -386,16 +394,137 @@ static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
     return Qfalse;
 }
 
+/*
+ * index(substring[, offset]) → Integer or nil
+ *
+ * For String arguments: native zero-alloc implementation using rb_memsearch.
+ * For Regexp arguments: delegates to String#index via shared string.
+ */
 static VALUE sv_index(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, id_index, argc, argv);
+    VALUE pattern, voffset;
+    rb_scan_args(argc, argv, "11", &pattern, &voffset);
+
+    /* Regexp path: delegate via shared string */
+    if (rb_obj_is_kind_of(pattern, rb_cRegexp)) {
+        VALUE shared = sv_as_shared_str(sv);
+        return rb_funcallv(shared, id_index, argc, argv);
+    }
+
+    StringValue(pattern);
+    const char *p = sv_ptr(sv);
+    long plen = RSTRING_LEN(pattern);
+
+    /* Determine starting char offset */
+    long char_off = NIL_P(voffset) ? 0 : NUM2LONG(voffset);
+    long total_chars = sv_char_count(sv);
+
+    if (char_off < 0) char_off += total_chars;
+    if (char_off < 0 || char_off > total_chars) return Qnil;
+
+    /* Convert char offset to byte offset */
+    long byte_off = sv_char_to_byte_offset(sv, char_off);
+    if (byte_off < 0) return Qnil;
+
+    if (plen == 0) return LONG2NUM(char_off);
+    if (plen > sv->length - byte_off) return Qnil;
+
+    long pos = rb_memsearch(RSTRING_PTR(pattern), plen,
+                             p + byte_off, sv->length - byte_off,
+                             sv_enc(sv));
+    if (pos < 0 || pos > sv->length - byte_off - plen) return Qnil;
+
+    /* Convert byte position back to character position */
+    if (sv_single_byte_optimizable(sv)) {
+        return LONG2NUM(char_off + pos);
+    }
+    /* Count chars from byte_off to byte_off+pos */
+    if (sv_is_utf8(sv)) {
+        long chars = sv_utf8_char_count(p + byte_off, pos);
+        return LONG2NUM(char_off + chars);
+    }
+    rb_encoding *enc = sv_enc(sv);
+    const char *s = p + byte_off;
+    const char *e = s + pos;
+    long chars = rb_enc_strlen(s, e, enc);
+    return LONG2NUM(char_off + chars);
 }
 
+/*
+ * rindex(substring[, offset]) → Integer or nil
+ *
+ * For String arguments: native zero-alloc reverse search.
+ * For Regexp arguments: delegates to String#rindex via shared string.
+ */
 static VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, id_rindex, argc, argv);
+    VALUE pattern, voffset;
+    rb_scan_args(argc, argv, "11", &pattern, &voffset);
+
+    /* Regexp path: delegate */
+    if (rb_obj_is_kind_of(pattern, rb_cRegexp)) {
+        VALUE shared = sv_as_shared_str(sv);
+        return rb_funcallv(shared, id_rindex, argc, argv);
+    }
+
+    StringValue(pattern);
+    const char *p = sv_ptr(sv);
+    long plen = RSTRING_LEN(pattern);
+    long total_chars = sv_char_count(sv);
+
+    /* Determine the maximum char position to search from */
+    long max_char;
+    if (NIL_P(voffset)) {
+        max_char = total_chars;
+    } else {
+        max_char = NUM2LONG(voffset);
+        if (max_char < 0) max_char += total_chars;
+        if (max_char < 0) return Qnil;
+        if (max_char > total_chars) max_char = total_chars;
+    }
+
+    if (plen == 0) {
+        return LONG2NUM(max_char > total_chars ? total_chars : max_char);
+    }
+    if (plen > sv->length) return Qnil;
+
+    /* Convert max_char to a byte limit */
+    long max_byte = sv_char_to_byte_offset(sv, max_char);
+    if (max_byte < 0) max_byte = sv->length;
+
+    /* Ensure we don't search past the point where the pattern can't fit */
+    long search_end = max_byte;
+    if (search_end + plen > sv->length) {
+        search_end = sv->length - plen;
+    }
+
+    /* Reverse byte search */
+    const char *needle = RSTRING_PTR(pattern);
+    const char *s;
+    for (s = p + search_end; s >= p; ) {
+        if (memcmp(s, needle, plen) == 0) {
+            long byte_pos = s - p;
+            /* Convert byte position to char position */
+            if (sv_single_byte_optimizable(sv)) {
+                return LONG2NUM(byte_pos);
+            }
+            if (sv_is_utf8(sv)) {
+                return LONG2NUM(sv_utf8_char_count(p, byte_pos));
+            }
+            rb_encoding *enc = sv_enc(sv);
+            return LONG2NUM(rb_enc_strlen(p, s, enc));
+        }
+        /* Move back one character */
+        if (s == p) break;
+        if (sv_single_byte_optimizable(sv)) {
+            s--;
+        } else {
+            rb_encoding *enc = sv_enc(sv);
+            s = rb_enc_prev_char(p, s, p + sv->length, enc);
+            if (s == NULL) break;
+        }
+    }
+    return Qnil;
 }
 
 static VALUE sv_getbyte(VALUE self, VALUE vidx) {
@@ -406,16 +535,83 @@ static VALUE sv_getbyte(VALUE self, VALUE vidx) {
     return INT2FIX((unsigned char)sv_ptr(sv)[idx]);
 }
 
+/*
+ * byteindex(substring[, offset]) → Integer or nil
+ *
+ * For String arguments: native zero-alloc byte-level search.
+ * For Regexp arguments: delegates to String#byteindex via shared string.
+ */
 static VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, id_byteindex, argc, argv);
+    VALUE pattern, voffset;
+    rb_scan_args(argc, argv, "11", &pattern, &voffset);
+
+    if (rb_obj_is_kind_of(pattern, rb_cRegexp)) {
+        VALUE shared = sv_as_shared_str(sv);
+        return rb_funcallv(shared, id_byteindex, argc, argv);
+    }
+
+    StringValue(pattern);
+    const char *p = sv_ptr(sv);
+    long plen = RSTRING_LEN(pattern);
+    long byte_off = NIL_P(voffset) ? 0 : NUM2LONG(voffset);
+
+    if (byte_off < 0) byte_off += sv->length;
+    if (byte_off < 0 || byte_off > sv->length) return Qnil;
+    if (plen == 0) return LONG2NUM(byte_off);
+    if (plen > sv->length - byte_off) return Qnil;
+
+    long pos = rb_memsearch(RSTRING_PTR(pattern), plen,
+                             p + byte_off, sv->length - byte_off,
+                             sv_enc(sv));
+    if (pos < 0 || pos > sv->length - byte_off - plen) return Qnil;
+    return LONG2NUM(byte_off + pos);
 }
 
+/*
+ * byterindex(substring[, offset]) → Integer or nil
+ *
+ * For String arguments: native zero-alloc reverse byte-level search.
+ * For Regexp arguments: delegates to String#byterindex via shared string.
+ */
 static VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, id_byterindex, argc, argv);
+    VALUE pattern, voffset;
+    rb_scan_args(argc, argv, "11", &pattern, &voffset);
+
+    if (rb_obj_is_kind_of(pattern, rb_cRegexp)) {
+        VALUE shared = sv_as_shared_str(sv);
+        return rb_funcallv(shared, id_byterindex, argc, argv);
+    }
+
+    StringValue(pattern);
+    const char *p = sv_ptr(sv);
+    long plen = RSTRING_LEN(pattern);
+    long max_byte;
+
+    if (NIL_P(voffset)) {
+        max_byte = sv->length;
+    } else {
+        max_byte = NUM2LONG(voffset);
+        if (max_byte < 0) max_byte += sv->length;
+        if (max_byte < 0) return Qnil;
+        if (max_byte > sv->length) max_byte = sv->length;
+    }
+
+    if (plen == 0) return LONG2NUM(max_byte > sv->length ? sv->length : max_byte);
+    if (plen > sv->length) return Qnil;
+
+    long search_end = max_byte;
+    if (search_end + plen > sv->length) search_end = sv->length - plen;
+
+    const char *needle = RSTRING_PTR(pattern);
+    long i;
+    for (i = search_end; i >= 0; i--) {
+        if (memcmp(p + i, needle, plen) == 0) {
+            return LONG2NUM(i);
+        }
+    }
+    return Qnil;
 }
 
 /* ========================================================================= */
@@ -616,6 +812,11 @@ SV_INLINE int sv_enc_compatible_for_eq(
     return is_7bit_1 || is_7bit_2;
 }
 
+SV_INLINE int sv_is_string_view(VALUE obj) {
+    VALUE klass = rb_obj_class(obj);
+    return klass == cStringView || klass == cStringViewStrict;
+}
+
 static VALUE sv_eq(VALUE self, VALUE other) {
     string_view_t *sv = sv_get_struct(self);
     const char *p = sv_ptr(sv);
@@ -633,8 +834,8 @@ static VALUE sv_eq(VALUE self, VALUE other) {
         return memcmp(p, RSTRING_PTR(other), sv->length) == 0 ? Qtrue : Qfalse;
     }
 
-    /* Check for StringView via class pointer (faster than rb_obj_is_kind_of) */
-    if (rb_obj_class(other) == cStringView) {
+    /* Check for StringView or StringView::Strict */
+    if (sv_is_string_view(other)) {
         string_view_t *o = sv_get_struct(other);
         if (sv->length != o->length) return Qfalse;
         if (sv->enc != o->enc) {
@@ -658,7 +859,7 @@ static VALUE sv_cmp(VALUE self, VALUE other) {
     if (SV_LIKELY(RB_TYPE_P(other, T_STRING))) {
         op = RSTRING_PTR(other);
         olen = RSTRING_LEN(other);
-    } else if (rb_obj_class(other) == cStringView) {
+    } else if (sv_is_string_view(other)) {
         string_view_t *o = sv_get_struct(other);
         op = sv_ptr(o);
         olen = o->length;
@@ -678,7 +879,7 @@ static VALUE sv_cmp(VALUE self, VALUE other) {
 }
 
 static VALUE sv_eql_p(VALUE self, VALUE other) {
-    if (rb_obj_class(other) != cStringView) return Qfalse;
+    if (!sv_is_string_view(other)) return Qfalse;
     return sv_eq(self, other);
 }
 
@@ -959,7 +1160,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
             if (idx < 0) idx += total;
             if (SV_UNLIKELY(idx < 0 || idx > total || len < 0)) return Qnil;
             if (idx + len > total) len = total - idx;
-            return sv_new_from_parent(sv,
+            return sv_new_from_parent_obj(self, sv,
                                        sv->offset + idx,
                                        len);
         }
@@ -985,7 +1186,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long byte_end = sv_char_to_byte_offset(sv, idx + len);
         long byte_len = byte_end - byte_off;
 
-        return sv_new_from_parent(sv,
+        return sv_new_from_parent_obj(self, sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -1004,7 +1205,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long byte_off = sv_char_to_byte_offset(sv, beg);
         long byte_len = sv_chars_to_bytes(sv, byte_off, len);
 
-        return sv_new_from_parent(sv,
+        return sv_new_from_parent_obj(self, sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -1020,7 +1221,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long byte_off = sv_char_to_byte_offset(sv, match_beg);
         long byte_len = RSTRING_LEN(matched);
 
-        return sv_new_from_parent(sv,
+        return sv_new_from_parent_obj(self, sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -1029,14 +1230,14 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         const char *p = sv_ptr(sv);
         long slen = RSTRING_LEN(arg1);
         if (slen == 0) {
-            return sv_new_from_parent(sv, sv->offset, 0);
+            return sv_new_from_parent_obj(self, sv, sv->offset, 0);
         }
         if (slen > sv->length) return Qnil;
 
         long pos = rb_memsearch(RSTRING_PTR(arg1), slen, p, sv->length, sv_enc(sv));
         if (pos < 0 || pos > sv->length - slen) return Qnil;
 
-        return sv_new_from_parent(sv, sv->offset + pos, slen);
+        return sv_new_from_parent_obj(self, sv, sv->offset + pos, slen);
     }
 
     if (RB_INTEGER_TYPE_P(arg1)) {
@@ -1051,7 +1252,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
         long byte_len = sv_chars_to_bytes(sv, byte_off, 1);
 
-        return sv_new_from_parent(sv,
+        return sv_new_from_parent_obj(self, sv,
                                    sv->offset + byte_off,
                                    byte_len);
     }
@@ -1080,7 +1281,7 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
         if (len < 0) return Qnil;
         if (off + len > sv->length) len = sv->length - off;
 
-        return sv_new_from_parent(sv, sv->offset + off, len);
+        return sv_new_from_parent_obj(self, sv, sv->offset + off, len);
     }
 
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
@@ -1091,16 +1292,317 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
         case Qnil:   return Qnil;
         }
 
-        return sv_new_from_parent(sv, sv->offset + beg, len);
+        return sv_new_from_parent_obj(self, sv, sv->offset + beg, len);
     }
 
     {
         long idx = NUM2LONG(arg1);
         if (idx < 0) idx += sv->length;
         if (idx < 0 || idx >= sv->length) return Qnil;
-        return sv_new_from_parent(sv, sv->offset + idx, 1);
+        return sv_new_from_parent_obj(self, sv, sv->offset + idx, 1);
     }
 }
+
+/* ========================================================================= */
+/* Tier 1.5: Zero-copy transforms — returns StringView via offset adjustment */
+/* ========================================================================= */
+
+/*
+ * Helper: check if a byte is ASCII whitespace.
+ * Matches Ruby's strip behavior for ASCII-compatible encodings:
+ * space, tab, newline, vertical tab, form feed, carriage return, NUL.
+ */
+SV_INLINE int sv_is_ascii_whitespace(unsigned char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r') || c == '\0';
+}
+
+/*
+ * strip → StringView
+ * Returns a new StringView with leading and trailing ASCII whitespace removed.
+ * Zero allocations for the byte content — only a new StringView struct.
+ */
+static VALUE sv_strip(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 0, 0);
+    string_view_t *sv = sv_get_struct(self);
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+    long len = sv->length;
+
+    /* Skip leading whitespace */
+    long left = 0;
+    while (left < len && sv_is_ascii_whitespace(p[left])) left++;
+
+    /* Skip trailing whitespace */
+    long right = len;
+    while (right > left && sv_is_ascii_whitespace(p[right - 1])) right--;
+
+    if (left == 0 && right == len) return self;
+    return sv_new_from_parent_obj(self, sv, sv->offset + left, right - left);
+}
+
+/*
+ * lstrip → StringView
+ * Returns a new StringView with leading ASCII whitespace removed.
+ */
+static VALUE sv_lstrip(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 0, 0);
+    string_view_t *sv = sv_get_struct(self);
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+    long len = sv->length;
+
+    long left = 0;
+    while (left < len && sv_is_ascii_whitespace(p[left])) left++;
+
+    if (left == 0) return self;
+    return sv_new_from_parent_obj(self, sv, sv->offset + left, len - left);
+}
+
+/*
+ * rstrip → StringView
+ * Returns a new StringView with trailing ASCII whitespace removed.
+ */
+static VALUE sv_rstrip(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 0, 0);
+    string_view_t *sv = sv_get_struct(self);
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+    long len = sv->length;
+
+    long right = len;
+    while (right > 0 && sv_is_ascii_whitespace(p[right - 1])) right--;
+
+    if (right == len) return self;
+    return sv_new_from_parent_obj(self, sv, sv->offset, right);
+}
+
+/*
+ * chomp([separator]) → StringView
+ * Returns a new StringView with the trailing record separator removed.
+ * Default separator is $/ (typically "\n").
+ * Handles "\n", "\r\n", and "\r" when separator is "\n".
+ */
+static VALUE sv_chomp(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 0, 1);
+    string_view_t *sv = sv_get_struct(self);
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+    long len = sv->length;
+
+    if (len == 0) return self;
+
+    if (argc == 0 || NIL_P(argv[0])) {
+        /* Default: remove trailing \n, \r\n, or \r */
+        /* Use $/ (input record separator) when no arg given */
+        VALUE rs;
+        if (argc == 0) {
+            rs = rb_rs; /* global $/ */
+            if (NIL_P(rs)) return self; /* $/ is nil, no chomp */
+        } else {
+            return self; /* chomp(nil) returns self */
+        }
+
+        /* Fast path for default $/ which is "\n" */
+        if (RB_TYPE_P(rs, T_STRING) && RSTRING_LEN(rs) == 1 && RSTRING_PTR(rs)[0] == '\n') {
+            if (p[len - 1] == '\n') {
+                long newlen = len - 1;
+                if (newlen > 0 && p[newlen - 1] == '\r') newlen--;
+                return sv_new_from_parent_obj(self, sv, sv->offset, newlen);
+            } else if (p[len - 1] == '\r') {
+                return sv_new_from_parent_obj(self, sv, sv->offset, len - 1);
+            }
+            return self;
+        }
+
+        /* Non-default $/ — use the separator */
+        if (!RB_TYPE_P(rs, T_STRING)) return self;
+        const char *sep = RSTRING_PTR(rs);
+        long seplen = RSTRING_LEN(rs);
+        if (seplen == 0) {
+            /* Paragraph mode: remove trailing \n+ */
+            long right = len;
+            while (right > 0 && p[right - 1] == '\n') right--;
+            if (right == len) return self;
+            return sv_new_from_parent_obj(self, sv, sv->offset, right);
+        }
+        if (seplen > len) return self;
+        if (memcmp(p + len - seplen, sep, seplen) == 0) {
+            return sv_new_from_parent_obj(self, sv, sv->offset, len - seplen);
+        }
+        return self;
+    }
+
+    /* Explicit separator argument */
+    VALUE sep_val = argv[0];
+    if (NIL_P(sep_val)) return self;
+    StringValue(sep_val);
+    const char *sep = RSTRING_PTR(sep_val);
+    long seplen = RSTRING_LEN(sep_val);
+
+    if (seplen == 0) {
+        /* Paragraph mode: remove all trailing newlines */
+        long right = len;
+        while (right > 0 && p[right - 1] == '\n') right--;
+        if (right == len) return self;
+        return sv_new_from_parent_obj(self, sv, sv->offset, right);
+    }
+
+    /* Special handling for "\n": also removes \r\n and \r */
+    if (seplen == 1 && sep[0] == '\n') {
+        if (p[len - 1] == '\n') {
+            long newlen = len - 1;
+            if (newlen > 0 && p[newlen - 1] == '\r') newlen--;
+            return sv_new_from_parent_obj(self, sv, sv->offset, newlen);
+        } else if (p[len - 1] == '\r') {
+            return sv_new_from_parent_obj(self, sv, sv->offset, len - 1);
+        }
+        return self;
+    }
+
+    if (seplen > len) return self;
+    if (memcmp(p + len - seplen, sep, seplen) == 0) {
+        return sv_new_from_parent_obj(self, sv, sv->offset, len - seplen);
+    }
+    return self;
+}
+
+/*
+ * chop → StringView
+ * Returns a new StringView with the last character removed.
+ * If the string ends with \r\n, both characters are removed.
+ */
+static VALUE sv_chop(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 0, 0);
+    string_view_t *sv = sv_get_struct(self);
+    long len = sv->length;
+
+    if (len == 0) return self;
+
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
+
+    /* Check for \r\n at the end */
+    if (len >= 2 && p[len - 1] == '\n' && p[len - 2] == '\r') {
+        return sv_new_from_parent_obj(self, sv, sv->offset, len - 2);
+    }
+
+    /* Remove last character (respecting encoding) */
+    if (sv_single_byte_optimizable(sv)) {
+        return sv_new_from_parent_obj(self, sv, sv->offset, len - 1);
+    }
+
+    /* Multibyte: find start of last character */
+    rb_encoding *enc = sv_enc(sv);
+    const char *start = sv_ptr(sv);
+    const char *end = start + len;
+    const char *prev = rb_enc_prev_char(start, end, end, enc);
+    if (prev == NULL) prev = start;
+    long newlen = (long)(prev - start);
+
+    return sv_new_from_parent_obj(self, sv, sv->offset, newlen);
+}
+
+/*
+ * delete_prefix(prefix) → StringView
+ * Returns a new StringView with the given prefix removed, or self if
+ * the string doesn't start with the prefix.
+ */
+static VALUE sv_delete_prefix(VALUE self, VALUE prefix) {
+    string_view_t *sv = sv_get_struct(self);
+    StringValue(prefix);
+    const char *p = sv_ptr(sv);
+    long plen = RSTRING_LEN(prefix);
+
+    if (plen > sv->length) return self;
+    if (plen == 0) return self;
+    if (memcmp(p, RSTRING_PTR(prefix), plen) != 0) return self;
+
+    return sv_new_from_parent_obj(self, sv, sv->offset + plen, sv->length - plen);
+}
+
+/*
+ * delete_suffix(suffix) → StringView
+ * Returns a new StringView with the given suffix removed, or self if
+ * the string doesn't end with the suffix.
+ */
+static VALUE sv_delete_suffix(VALUE self, VALUE suffix) {
+    string_view_t *sv = sv_get_struct(self);
+    StringValue(suffix);
+    const char *p = sv_ptr(sv);
+    long slen = RSTRING_LEN(suffix);
+
+    if (slen > sv->length) return self;
+    if (slen == 0) return self;
+    if (memcmp(p + sv->length - slen, RSTRING_PTR(suffix), slen) != 0) return self;
+
+    return sv_new_from_parent_obj(self, sv, sv->offset, sv->length - slen);
+}
+
+/*
+ * chr → StringView
+ * Returns the first character as a StringView.
+ */
+static VALUE sv_chr(VALUE self) {
+    string_view_t *sv = sv_get_struct(self);
+
+    if (sv->length == 0) return self;
+
+    if (sv_single_byte_optimizable(sv)) {
+        return sv_new_from_parent_obj(self, sv, sv->offset, 1);
+    }
+
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
+    int clen = rb_enc_fast_mbclen(p, e, enc);
+
+    return sv_new_from_parent_obj(self, sv, sv->offset, clen);
+}
+
+/*
+ * ord → Integer
+ * Returns the codepoint of the first character.
+ */
+static VALUE sv_ord(VALUE self) {
+    string_view_t *sv = sv_get_struct(self);
+
+    if (sv->length == 0) {
+        rb_raise(rb_eArgError, "empty string");
+    }
+
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
+    unsigned int c = rb_enc_codepoint_len(p, e, NULL, enc);
+    return UINT2NUM(c);
+}
+
+/*
+ * valid_encoding? → true/false
+ * Returns whether the view's bytes are valid in its encoding.
+ */
+static VALUE sv_valid_encoding_p(VALUE self) {
+    string_view_t *sv = sv_get_struct(self);
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
+
+    while (p < e) {
+        int len = rb_enc_precise_mbclen(p, e, enc);
+        if (!MBCLEN_CHARFOUND_P(len)) return Qfalse;
+        p += MBCLEN_CHARFOUND_LEN(len);
+    }
+    return Qtrue;
+}
+
+/*
+ * b → StringView
+ * Returns a new StringView that references the same bytes but with
+ * ASCII-8BIT encoding. Since we share the same backing bytes, this is
+ * only valid when the backing is also binary-compatible, which it always
+ * is — we just reinterpret the bytes.
+ *
+ * Note: We need to create a new backing with binary encoding since
+ * the encoding is tied to the backing string.
+ * Actually, the encoding is cached in sv->enc, so we can create a
+ * lightweight view with different encoding. But the backing string
+ * has its own encoding... For true zero-alloc we store enc separately.
+ */
 
 /* ========================================================================= */
 /* Tier 3: Transform delegation                                              */
@@ -1121,11 +1623,6 @@ SV_DELEGATE_FUNCALL(upcase,    id_upcase)
 SV_DELEGATE_FUNCALL(downcase,  id_downcase)
 SV_DELEGATE_FUNCALL(capitalize,id_capitalize)
 SV_DELEGATE_FUNCALL(swapcase,  id_swapcase)
-SV_DELEGATE_FUNCALL(strip,     id_strip)
-SV_DELEGATE_FUNCALL(lstrip,    id_lstrip)
-SV_DELEGATE_FUNCALL(rstrip,    id_rstrip)
-SV_DELEGATE_FUNCALL(chomp,     id_chomp)
-SV_DELEGATE_FUNCALL(chop,      id_chop)
 SV_DELEGATE_FUNCALL(reverse,   id_reverse)
 SV_DELEGATE_FUNCALL(squeeze,   id_squeeze)
 SV_DELEGATE_FUNCALL(encode,    id_encode)
@@ -1134,6 +1631,11 @@ SV_DELEGATE_FUNCALL(sub,       id_sub)
 SV_DELEGATE_FUNCALL(tr,        id_tr)
 SV_DELEGATE_FUNCALL(tr_s,      id_tr_s)
 SV_DELEGATE_FUNCALL(delete_str,id_delete)
+/*
+ * count(set, ...) → Integer
+ * Delegates to String#count via shared string.
+ * (Character set parsing is complex — reuse Ruby's implementation.)
+ */
 SV_DELEGATE_FUNCALL(count,     id_count)
 SV_DELEGATE_FUNCALL(scan,      id_scan)
 SV_DELEGATE_FUNCALL(split,     id_split)
@@ -1155,6 +1657,63 @@ static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
     (void)argc; (void)argv;
     rb_raise(rb_eFrozenError, "can't modify frozen StringView");
     return Qnil;
+}
+
+/* ========================================================================= */
+/* StringView::Strict — raises WouldAllocate for any allocating method       */
+/* ========================================================================= */
+
+/*
+ * Raise StringView::WouldAllocate with the method name.
+ * Used for all methods on Strict that would create a String.
+ */
+static VALUE sv_would_allocate(int argc, VALUE *argv, VALUE self) {
+    const char *method_name = rb_id2name(rb_frame_this_func());
+    rb_raise(eWouldAllocate,
+             "StringView::Strict#%s would allocate a String — "
+             "call .materialize to get a String, or .reset! to repoint the view",
+             method_name);
+    return Qnil;
+}
+
+/*
+ * Strict versions of index/rindex/byteindex/byterindex:
+ * String args work zero-alloc. Regexp args raise WouldAllocate.
+ */
+static VALUE sv_strict_index(int argc, VALUE *argv, VALUE self) {
+    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
+        rb_raise(eWouldAllocate,
+                 "StringView::Strict#index with Regexp would allocate a String — "
+                 "call .materialize to get a String, or .reset! to repoint the view");
+    }
+    return sv_index(argc, argv, self);
+}
+
+static VALUE sv_strict_rindex(int argc, VALUE *argv, VALUE self) {
+    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
+        rb_raise(eWouldAllocate,
+                 "StringView::Strict#rindex with Regexp would allocate a String — "
+                 "call .materialize to get a String, or .reset! to repoint the view");
+    }
+    return sv_rindex(argc, argv, self);
+}
+
+static VALUE sv_strict_byteindex(int argc, VALUE *argv, VALUE self) {
+    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
+        rb_raise(eWouldAllocate,
+                 "StringView::Strict#byteindex with Regexp would allocate a String — "
+                 "call .materialize to get a String, or .reset! to repoint the view");
+    }
+    return sv_byteindex(argc, argv, self);
+}
+
+static VALUE sv_strict_byterindex(int argc, VALUE *argv, VALUE self) {
+    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
+        rb_raise(eWouldAllocate,
+                 "StringView::Strict#byterindex with Regexp would allocate a String — "
+                 "call .materialize to get a String, or .reset! to repoint the view");
+    }
+    return sv_byterindex(argc, argv, self);
 }
 
 /* ========================================================================= */
@@ -1211,10 +1770,10 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "initialize", sv_initialize, -1);
 
     rb_define_method(cStringView, "to_s",       sv_to_s,       0);
+    rb_define_method(cStringView, "materialize", sv_to_s,      0);
     rb_define_private_method(cStringView, "to_str", sv_to_str, 0);
     rb_define_method(cStringView, "inspect",    sv_inspect,    0);
     rb_define_method(cStringView, "reset!",     sv_reset,      3);
-    rb_define_alias(cStringView,  "materialize", "to_s");
 
     rb_define_method(cStringView, "bytesize",    sv_bytesize,    0);
     rb_define_method(cStringView, "length",      sv_length,      0);
@@ -1264,6 +1823,11 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "rstrip",      sv_rstrip,     -1);
     rb_define_method(cStringView, "chomp",       sv_chomp,      -1);
     rb_define_method(cStringView, "chop",        sv_chop,       -1);
+    rb_define_method(cStringView, "delete_prefix", sv_delete_prefix, 1);
+    rb_define_method(cStringView, "delete_suffix", sv_delete_suffix, 1);
+    rb_define_method(cStringView, "chr",         sv_chr,         0);
+    rb_define_method(cStringView, "ord",         sv_ord,         0);
+    rb_define_method(cStringView, "valid_encoding?", sv_valid_encoding_p, 0);
     rb_define_method(cStringView, "reverse",     sv_reverse,    -1);
     rb_define_method(cStringView, "squeeze",     sv_squeeze,    -1);
     rb_define_method(cStringView, "encode",      sv_encode,     -1);
@@ -1302,4 +1866,72 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "gsub!",       sv_frozen_error, -1);
     rb_define_method(cStringView, "sub!",        sv_frozen_error, -1);
     rb_define_method(cStringView, "slice!",      sv_frozen_error, -1);
+    rb_define_method(cStringView, "delete_prefix!", sv_frozen_error, -1);
+    rb_define_method(cStringView, "delete_suffix!", sv_frozen_error, -1);
+
+    /* =================================================================== */
+    /* StringView::Strict                                                  */
+    /* =================================================================== */
+
+    eWouldAllocate = rb_define_class_under(cStringView, "WouldAllocate", rb_eRuntimeError);
+
+    cStringViewStrict = rb_define_class_under(cStringView, "Strict", cStringView);
+
+    /* Strict inherits everything from StringView (including alloc, initialize,
+     * all zero-copy methods, slicing, comparisons, etc.).
+     *
+     * Override only methods that would allocate a String object.
+     * to_s / materialize is the explicit escape hatch. */
+
+    /* Tier 3 transforms — all allocate a result String */
+    rb_define_method(cStringViewStrict, "upcase",      sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "downcase",    sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "capitalize",  sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "swapcase",    sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "reverse",     sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "squeeze",     sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "encode",      sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "gsub",        sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "sub",         sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "tr",          sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "tr_s",        sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "delete",      sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "scan",        sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "split",       sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "center",      sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "ljust",       sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "rjust",       sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "%",           sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "+",           sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "*",           sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "unpack1",     sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "scrub",       sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "unicode_normalize", sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "count",       sv_would_allocate, -1);
+
+    /* index/rindex/byteindex/byterindex: String args are zero-alloc,
+     * Regexp args raise WouldAllocate. */
+    rb_define_method(cStringViewStrict, "index",       sv_strict_index,       -1);
+    rb_define_method(cStringViewStrict, "rindex",      sv_strict_rindex,      -1);
+    rb_define_method(cStringViewStrict, "byteindex",   sv_strict_byteindex,   -1);
+    rb_define_method(cStringViewStrict, "byterindex",  sv_strict_byterindex,  -1);
+
+    /* Regex-based methods — always allocate */
+    rb_define_method(cStringViewStrict, "match",       sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "match?",      sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "=~",          sv_would_allocate, -1);
+
+    /* Iteration methods that yield/return Strings */
+    rb_define_method(cStringViewStrict, "each_char",   sv_would_allocate, -1);
+    rb_define_method(cStringViewStrict, "chars",       sv_would_allocate, -1);
+
+    /* Implicit coercion — would create a shared String */
+    rb_define_private_method(cStringViewStrict, "to_str", sv_would_allocate, -1);
+
+    /* inspect allocates a String (but we keep it — debugging is essential) */
+
+    /* to_s raises — Strict views act like frozen strings, not string sources.
+     * materialize is the EXPLICIT escape hatch (inherited from StringView,
+     * defined as a separate method pointing at sv_to_s). */
+    rb_define_method(cStringViewStrict, "to_s",  sv_would_allocate, -1);
 }

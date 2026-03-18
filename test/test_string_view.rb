@@ -670,36 +670,214 @@ class TestStringView < Minitest::Test
   def test_strip
     sv = StringView.new("  hello  ")
     result = sv.strip
-    assert_instance_of(String, result)
-    assert_equal("hello", result)
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_strip_no_whitespace_returns_self
+    sv = StringView.new("hello")
+    result = sv.strip
+    assert_same(sv, result)
+  end
+
+  def test_strip_on_slice
+    sv = StringView.new("xx  hello  xx", 2, 9) # "  hello  "
+    result = sv.strip
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_strip_all_whitespace
+    sv = StringView.new("   \t\n  ")
+    result = sv.strip
+    assert_instance_of(StringView, result)
+    assert_predicate(result, :empty?)
   end
 
   def test_lstrip
     sv = StringView.new("  hello  ")
     result = sv.lstrip
-    assert_instance_of(String, result)
-    assert_equal("hello  ", result)
+    assert_instance_of(StringView, result)
+    assert_equal("hello  ", result.to_s)
+  end
+
+  def test_lstrip_no_whitespace_returns_self
+    sv = StringView.new("hello  ")
+    result = sv.lstrip
+    assert_same(sv, result)
   end
 
   def test_rstrip
     sv = StringView.new("  hello  ")
     result = sv.rstrip
-    assert_instance_of(String, result)
-    assert_equal("  hello", result)
+    assert_instance_of(StringView, result)
+    assert_equal("  hello", result.to_s)
+  end
+
+  def test_rstrip_no_whitespace_returns_self
+    sv = StringView.new("  hello")
+    result = sv.rstrip
+    assert_same(sv, result)
   end
 
   def test_chomp
     sv = StringView.new("hello\n")
     result = sv.chomp
-    assert_instance_of(String, result)
-    assert_equal("hello", result)
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chomp_crlf
+    sv = StringView.new("hello\r\n")
+    result = sv.chomp
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chomp_cr
+    sv = StringView.new("hello\r")
+    result = sv.chomp
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chomp_no_newline_returns_self
+    sv = StringView.new("hello")
+    result = sv.chomp
+    assert_same(sv, result)
+  end
+
+  def test_chomp_with_separator
+    sv = StringView.new("hello!")
+    result = sv.chomp("!")
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chomp_with_empty_separator_paragraph_mode
+    sv = StringView.new("hello\n\n\n")
+    result = sv.chomp("")
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chomp_nil_returns_self
+    sv = StringView.new("hello\n")
+    result = sv.chomp(nil)
+    assert_same(sv, result)
   end
 
   def test_chop
     sv = StringView.new("hello")
     result = sv.chop
-    assert_instance_of(String, result)
-    assert_equal("hell", result)
+    assert_instance_of(StringView, result)
+    assert_equal("hell", result.to_s)
+  end
+
+  def test_chop_crlf
+    sv = StringView.new("hello\r\n")
+    result = sv.chop
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chop_empty_returns_self
+    sv = StringView.new("")
+    result = sv.chop
+    assert_same(sv, result)
+  end
+
+  def test_chop_multibyte
+    sv = StringView.new("café")
+    result = sv.chop
+    assert_equal("caf", result.to_s)
+  end
+
+  def test_delete_prefix
+    sv = StringView.new("hello world")
+    result = sv.delete_prefix("hello ")
+    assert_instance_of(StringView, result)
+    assert_equal("world", result.to_s)
+  end
+
+  def test_delete_prefix_no_match_returns_self
+    sv = StringView.new("hello world")
+    result = sv.delete_prefix("xyz")
+    assert_same(sv, result)
+  end
+
+  def test_delete_prefix_on_slice
+    sv = StringView.new("xxhello world", 2, 11) # "hello world"
+    result = sv.delete_prefix("hello ")
+    assert_instance_of(StringView, result)
+    assert_equal("world", result.to_s)
+  end
+
+  def test_delete_suffix
+    sv = StringView.new("hello world")
+    result = sv.delete_suffix(" world")
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_delete_suffix_no_match_returns_self
+    sv = StringView.new("hello world")
+    result = sv.delete_suffix("xyz")
+    assert_same(sv, result)
+  end
+
+  def test_delete_suffix_on_slice
+    sv = StringView.new("hello worldxx", 0, 11) # "hello world"
+    result = sv.delete_suffix(" world")
+    assert_instance_of(StringView, result)
+    assert_equal("hello", result.to_s)
+  end
+
+  def test_chr
+    sv = StringView.new("hello")
+    result = sv.chr
+    assert_instance_of(StringView, result)
+    assert_equal("h", result.to_s)
+  end
+
+  def test_chr_multibyte
+    sv = StringView.new("café")
+    result = sv.chr
+    assert_equal("c", result.to_s)
+  end
+
+  def test_chr_multibyte_lead
+    sv = StringView.new("日本語")
+    result = sv.chr
+    assert_equal("日", result.to_s)
+  end
+
+  def test_chr_empty
+    sv = StringView.new("")
+    result = sv.chr
+    assert_same(sv, result)
+  end
+
+  def test_ord
+    sv = StringView.new("hello")
+    assert_equal(104, sv.ord) # 'h' = 104
+  end
+
+  def test_ord_multibyte
+    sv = StringView.new("日本語")
+    assert_equal(26085, sv.ord) # 日 = U+65E5 = 26085
+  end
+
+  def test_ord_empty_raises
+    sv = StringView.new("")
+    assert_raises(ArgumentError) { sv.ord }
+  end
+
+  def test_valid_encoding_true
+    sv = StringView.new("hello")
+    assert_predicate(sv, :valid_encoding?)
+  end
+
+  def test_valid_encoding_invalid
+    bad = "\xFF\xFE".b.force_encoding("UTF-8")
+    sv = StringView.new(bad)
+    refute_predicate(sv, :valid_encoding?)
   end
 
   def test_reverse

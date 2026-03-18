@@ -13,3 +13,32 @@ AllCops:
 Style/GlobalVars:
   Exclude:
     - ext/string_view/extconf.rb
+
+# StringView is a class (defined in C), not a module. The compact form
+# `module StringView::SexpParser` is required to reopen it correctly.
+Style/ClassAndModuleChildren:
+  Exclude:
+    - test/**/*.rb
+
+Style/RedundantRegexpArgument:
+  Exclude:
+    - test/**/*.rb
+
+# Parser/bench code naturally nests deeply — this is fine for lexers.
+Metrics/BlockNesting:
+  Exclude:
+    - bench/**/*.rb
+
+# `def self.method` is clear and common in parser modules.
+Style/ClassMethodsDefinitions:
+  Enabled: false
+
+# assert_equal(true, x) tests for literal boolean, not truthiness.
+# assert(x) would pass for any truthy value, which is wrong here.
+Minitest/AssertTruthy:
+  Enabled: false
+
+# assert_equal(false, x) tests for literal boolean false.
+# refute(x) would pass for nil, which is wrong here.
+Minitest/RefuteFalse:
+  Enabled: false
