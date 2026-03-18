@@ -41,6 +41,19 @@ typedef struct {
 
 static VALUE cStringView;
 
+/* Cached method IDs — initialized once in Init_string_view */
+static ID id_index, id_rindex, id_byteindex, id_byterindex;
+static ID id_match, id_match_p, id_match_op;
+static ID id_begin, id_end, id_exclude_end_p, id_aref;
+static ID id_upcase, id_downcase, id_capitalize, id_swapcase;
+static ID id_strip, id_lstrip, id_rstrip;
+static ID id_chomp, id_chop, id_reverse, id_squeeze;
+static ID id_encode, id_gsub, id_sub, id_tr, id_tr_s;
+static ID id_delete, id_count, id_scan, id_split;
+static ID id_center, id_ljust, id_rjust;
+static ID id_format_op, id_plus, id_multiply;
+static ID id_unpack1, id_scrub, id_unicode_normalize;
+
 /*
  * GC callbacks.
  *
@@ -373,13 +386,13 @@ static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
 static VALUE sv_index(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("index"), argc, argv);
+    return rb_funcallv(shared, id_index, argc, argv);
 }
 
 static VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("rindex"), argc, argv);
+    return rb_funcallv(shared, id_rindex, argc, argv);
 }
 
 static VALUE sv_getbyte(VALUE self, VALUE vidx) {
@@ -393,13 +406,13 @@ static VALUE sv_getbyte(VALUE self, VALUE vidx) {
 static VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("byteindex"), argc, argv);
+    return rb_funcallv(shared, id_byteindex, argc, argv);
 }
 
 static VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("byterindex"), argc, argv);
+    return rb_funcallv(shared, id_byterindex, argc, argv);
 }
 
 /* ========================================================================= */
@@ -463,19 +476,19 @@ static VALUE sv_chars(VALUE self) {
 static VALUE sv_match(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("match"), argc, argv);
+    return rb_funcallv(shared, id_match, argc, argv);
 }
 
 static VALUE sv_match_p(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcallv(shared, rb_intern("match?"), argc, argv);
+    return rb_funcallv(shared, id_match_p, argc, argv);
 }
 
 static VALUE sv_match_operator(VALUE self, VALUE pattern) {
     string_view_t *sv = sv_get_struct(self);
     VALUE shared = sv_as_shared_str(sv);
-    return rb_funcall(shared, rb_intern("=~"), 1, pattern);
+    return rb_funcall(shared, id_match_op, 1, pattern);
 }
 
 /* ========================================================================= */
@@ -930,9 +943,9 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         long total_chars = sv_char_count(sv);
         long beg, len;
         int excl;
-        VALUE rb_beg = rb_funcall(arg1, rb_intern("begin"), 0);
-        VALUE rb_end = rb_funcall(arg1, rb_intern("end"), 0);
-        excl = RTEST(rb_funcall(arg1, rb_intern("exclude_end?"), 0));
+        VALUE rb_beg = rb_funcall(arg1, id_begin, 0);
+        VALUE rb_end = rb_funcall(arg1, id_end, 0);
+        excl = RTEST(rb_funcall(arg1, id_exclude_end_p, 0));
 
         beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
         if (beg < 0) beg += total_chars;
@@ -961,11 +974,11 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
     if (rb_obj_is_kind_of(arg1, rb_cRegexp)) {
         VALUE shared = sv_as_shared_str(sv);
-        VALUE m = rb_funcall(arg1, rb_intern("match"), 1, shared);
+        VALUE m = rb_funcall(arg1, id_match, 1, shared);
         if (NIL_P(m)) return Qnil;
 
-        VALUE matched = rb_funcall(m, rb_intern("[]"), 1, INT2FIX(0));
-        long match_beg = NUM2LONG(rb_funcall(m, rb_intern("begin"), 1, INT2FIX(0)));
+        VALUE matched = rb_funcall(m, id_aref, 1, INT2FIX(0));
+        long match_beg = NUM2LONG(rb_funcall(m, id_begin, 1, INT2FIX(0)));
 
         long byte_off = sv_char_to_byte_offset(sv, match_beg);
         long byte_len = RSTRING_LEN(matched);
@@ -1035,9 +1048,9 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
 
     if (rb_obj_is_kind_of(arg1, rb_cRange)) {
         long beg, len;
-        VALUE rb_beg = rb_funcall(arg1, rb_intern("begin"), 0);
-        VALUE rb_end = rb_funcall(arg1, rb_intern("end"), 0);
-        int excl = RTEST(rb_funcall(arg1, rb_intern("exclude_end?"), 0));
+        VALUE rb_beg = rb_funcall(arg1, id_begin, 0);
+        VALUE rb_end = rb_funcall(arg1, id_end, 0);
+        int excl = RTEST(rb_funcall(arg1, id_exclude_end_p, 0));
 
         beg = NIL_P(rb_beg) ? 0 : NUM2LONG(rb_beg);
         if (beg < 0) beg += sv->length;
@@ -1071,46 +1084,46 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
 /* Tier 3: Transform delegation                                              */
 /* ========================================================================= */
 
-#define SV_DELEGATE_FUNCALL(cname, rbname)                              \
+#define SV_DELEGATE_FUNCALL(cname, cached_id)                           \
     static VALUE sv_##cname(int argc, VALUE *argv, VALUE self) {        \
         string_view_t *sv = sv_get_struct(self);                        \
         VALUE shared = sv_as_shared_str(sv);                            \
         if (rb_block_given_p()) {                                       \
-            return rb_funcall_with_block(shared, rb_intern(rbname),     \
+            return rb_funcall_with_block(shared, cached_id,             \
                                          argc, argv, rb_block_proc()); \
         }                                                               \
-        return rb_funcallv(shared, rb_intern(rbname), argc, argv);      \
+        return rb_funcallv(shared, cached_id, argc, argv);              \
     }
 
-SV_DELEGATE_FUNCALL(upcase,    "upcase")
-SV_DELEGATE_FUNCALL(downcase,  "downcase")
-SV_DELEGATE_FUNCALL(capitalize,"capitalize")
-SV_DELEGATE_FUNCALL(swapcase,  "swapcase")
-SV_DELEGATE_FUNCALL(strip,     "strip")
-SV_DELEGATE_FUNCALL(lstrip,    "lstrip")
-SV_DELEGATE_FUNCALL(rstrip,    "rstrip")
-SV_DELEGATE_FUNCALL(chomp,     "chomp")
-SV_DELEGATE_FUNCALL(chop,      "chop")
-SV_DELEGATE_FUNCALL(reverse,   "reverse")
-SV_DELEGATE_FUNCALL(squeeze,   "squeeze")
-SV_DELEGATE_FUNCALL(encode,    "encode")
-SV_DELEGATE_FUNCALL(gsub,      "gsub")
-SV_DELEGATE_FUNCALL(sub,       "sub")
-SV_DELEGATE_FUNCALL(tr,        "tr")
-SV_DELEGATE_FUNCALL(tr_s,      "tr_s")
-SV_DELEGATE_FUNCALL(delete_str, "delete")
-SV_DELEGATE_FUNCALL(count,     "count")
-SV_DELEGATE_FUNCALL(scan,      "scan")
-SV_DELEGATE_FUNCALL(split,     "split")
-SV_DELEGATE_FUNCALL(center,    "center")
-SV_DELEGATE_FUNCALL(ljust,     "ljust")
-SV_DELEGATE_FUNCALL(rjust,     "rjust")
-SV_DELEGATE_FUNCALL(format_op, "%")
-SV_DELEGATE_FUNCALL(plus,      "+")
-SV_DELEGATE_FUNCALL(multiply,  "*")
-SV_DELEGATE_FUNCALL(unpack1,   "unpack1")
-SV_DELEGATE_FUNCALL(scrub,     "scrub")
-SV_DELEGATE_FUNCALL(unicode_normalize, "unicode_normalize")
+SV_DELEGATE_FUNCALL(upcase,    id_upcase)
+SV_DELEGATE_FUNCALL(downcase,  id_downcase)
+SV_DELEGATE_FUNCALL(capitalize,id_capitalize)
+SV_DELEGATE_FUNCALL(swapcase,  id_swapcase)
+SV_DELEGATE_FUNCALL(strip,     id_strip)
+SV_DELEGATE_FUNCALL(lstrip,    id_lstrip)
+SV_DELEGATE_FUNCALL(rstrip,    id_rstrip)
+SV_DELEGATE_FUNCALL(chomp,     id_chomp)
+SV_DELEGATE_FUNCALL(chop,      id_chop)
+SV_DELEGATE_FUNCALL(reverse,   id_reverse)
+SV_DELEGATE_FUNCALL(squeeze,   id_squeeze)
+SV_DELEGATE_FUNCALL(encode,    id_encode)
+SV_DELEGATE_FUNCALL(gsub,      id_gsub)
+SV_DELEGATE_FUNCALL(sub,       id_sub)
+SV_DELEGATE_FUNCALL(tr,        id_tr)
+SV_DELEGATE_FUNCALL(tr_s,      id_tr_s)
+SV_DELEGATE_FUNCALL(delete_str,id_delete)
+SV_DELEGATE_FUNCALL(count,     id_count)
+SV_DELEGATE_FUNCALL(scan,      id_scan)
+SV_DELEGATE_FUNCALL(split,     id_split)
+SV_DELEGATE_FUNCALL(center,    id_center)
+SV_DELEGATE_FUNCALL(ljust,     id_ljust)
+SV_DELEGATE_FUNCALL(rjust,     id_rjust)
+SV_DELEGATE_FUNCALL(format_op, id_format_op)
+SV_DELEGATE_FUNCALL(plus,      id_plus)
+SV_DELEGATE_FUNCALL(multiply,  id_multiply)
+SV_DELEGATE_FUNCALL(unpack1,   id_unpack1)
+SV_DELEGATE_FUNCALL(scrub,     id_scrub)
+SV_DELEGATE_FUNCALL(unicode_normalize, id_unicode_normalize)
 
 /* ========================================================================= */
 /* Bang methods — always raise FrozenError                                   */
@@ -1129,6 +1142,48 @@ static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
 
 void Init_string_view(void) {
     enc_utf8 = rb_utf8_encoding();
+
+    /* Cache method IDs — avoids rb_intern hash lookup on every call */
+    id_index       = rb_intern("index");
+    id_rindex      = rb_intern("rindex");
+    id_byteindex   = rb_intern("byteindex");
+    id_byterindex  = rb_intern("byterindex");
+    id_match       = rb_intern("match");
+    id_match_p     = rb_intern("match?");
+    id_match_op    = rb_intern("=~");
+    id_begin       = rb_intern("begin");
+    id_end         = rb_intern("end");
+    id_exclude_end_p = rb_intern("exclude_end?");
+    id_aref        = rb_intern("[]");
+    id_upcase      = rb_intern("upcase");
+    id_downcase    = rb_intern("downcase");
+    id_capitalize  = rb_intern("capitalize");
+    id_swapcase    = rb_intern("swapcase");
+    id_strip       = rb_intern("strip");
+    id_lstrip      = rb_intern("lstrip");
+    id_rstrip      = rb_intern("rstrip");
+    id_chomp       = rb_intern("chomp");
+    id_chop        = rb_intern("chop");
+    id_reverse     = rb_intern("reverse");
+    id_squeeze     = rb_intern("squeeze");
+    id_encode      = rb_intern("encode");
+    id_gsub        = rb_intern("gsub");
+    id_sub         = rb_intern("sub");
+    id_tr          = rb_intern("tr");
+    id_tr_s        = rb_intern("tr_s");
+    id_delete      = rb_intern("delete");
+    id_count       = rb_intern("count");
+    id_scan        = rb_intern("scan");
+    id_split       = rb_intern("split");
+    id_center      = rb_intern("center");
+    id_ljust       = rb_intern("ljust");
+    id_rjust       = rb_intern("rjust");
+    id_format_op   = rb_intern("%");
+    id_plus        = rb_intern("+");
+    id_multiply    = rb_intern("*");
+    id_unpack1     = rb_intern("unpack1");
+    id_scrub       = rb_intern("scrub");
+    id_unicode_normalize = rb_intern("unicode_normalize");
 
     cStringView = rb_define_class("StringView", rb_cObject);
     rb_include_module(cStringView, rb_mComparable);
