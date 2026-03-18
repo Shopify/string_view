@@ -149,7 +149,7 @@ SV_INLINE VALUE sv_new_from_parent(string_view_t *parent, long offset, long leng
     sv->single_byte = parent->single_byte;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
-    FL_SET_RAW(obj, FL_FREEZE);
+    /* Not frozen — see sv_initialize comment for rationale */
     return obj;
 }
 
