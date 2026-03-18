@@ -1098,7 +1098,7 @@ SV_DELEGATE_FUNCALL(gsub,      "gsub")
 SV_DELEGATE_FUNCALL(sub,       "sub")
 SV_DELEGATE_FUNCALL(tr,        "tr")
 SV_DELEGATE_FUNCALL(tr_s,      "tr_s")
-SV_DELEGATE_FUNCALL(sv_delete, "delete")
+SV_DELEGATE_FUNCALL(delete_str, "delete")
 SV_DELEGATE_FUNCALL(count,     "count")
 SV_DELEGATE_FUNCALL(scan,      "scan")
 SV_DELEGATE_FUNCALL(split,     "split")
@@ -1198,7 +1198,7 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "sub",         sv_sub,        -1);
     rb_define_method(cStringView, "tr",          sv_tr,         -1);
     rb_define_method(cStringView, "tr_s",        sv_tr_s,       -1);
-    rb_define_method(cStringView, "delete",      sv_sv_delete,  -1);
+    rb_define_method(cStringView, "delete",      sv_delete_str, -1);
     rb_define_method(cStringView, "count",       sv_count,      -1);
     rb_define_method(cStringView, "scan",        sv_scan,       -1);
     rb_define_method(cStringView, "split",       sv_split,      -1);
