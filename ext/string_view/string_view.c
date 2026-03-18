@@ -1103,9 +1103,8 @@ SV_DELEGATE_FUNCALL(unicode_normalize, id_unicode_normalize)
 /* ========================================================================= */
 
 static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
-    VALUE str = sv_to_s(self);
-    rb_raise(rb_eFrozenError, "can't modify frozen StringView: \"%s\"",
-             StringValueCStr(str));
+    (void)argc; (void)argv;
+    rb_raise(rb_eFrozenError, "can't modify frozen StringView");
     return Qnil;
 }
 
