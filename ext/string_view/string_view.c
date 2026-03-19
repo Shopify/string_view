@@ -1,47 +1,12 @@
-#include "ruby.h"
-#include "ruby/encoding.h"
-#include "ruby/re.h"
-#include "simdutf_c.h"
-
-#define SV_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define SV_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
-#ifdef __GNUC__
-#define SV_INLINE static inline __attribute__((always_inline))
-#else
-#define SV_INLINE static inline
-#endif
+#include "string_view.h"
 
 /* ========================================================================= */
-/* Struct & TypedData                                                        */
+/* Globals                                                                   */
 /* ========================================================================= */
 
-/*
- * Stride index: maps every STRIDE_CHARS-th character to its byte offset.
- * Built lazily on first char-indexed access. Enables O(1) char→byte
- * lookup for any offset (small scalar scan within one stride).
- */
-#define STRIDE_CHARS 128
-
-typedef struct {
-    long *offsets;   /* offsets[i] = byte offset of character i*STRIDE_CHARS */
-    long  count;     /* number of entries = ceil(charlen / STRIDE_CHARS) + 1 */
-} stride_index_t;
-
-typedef struct {
-    VALUE  backing;     /* frozen String that owns the bytes */
-    const char *base;   /* cached RSTRING_PTR(backing) — avoids indirection */
-    rb_encoding *enc;   /* cached encoding — avoids rb_enc_get per call */
-    long   offset;      /* byte offset into backing */
-    long   length;      /* byte length of this view */
-    long   charlen;     /* cached character count; -1 = not yet computed */
-    int    single_byte; /* cached: 1 if char==byte (ASCII/single-byte enc), 0 if multibyte, -1 unknown */
-    stride_index_t *stride_idx; /* lazily built stride index for multibyte, NULL if not built */
-} string_view_t;
-
-static VALUE cStringView;
-static VALUE cStringViewStrict;
-static VALUE eWouldAllocate;
+VALUE cStringView;
+VALUE cStringViewStrict;
+VALUE eWouldAllocate;
 
 /* Cached method IDs — initialized once in Init_string_view */
 static ID id_index, id_rindex, id_byteindex, id_byterindex;
@@ -100,233 +65,18 @@ static size_t sv_memsize(const void *ptr) {
     return size;
 }
 
-static const rb_data_type_t string_view_type = {
+const rb_data_type_t string_view_type = {
     .wrap_struct_name = "StringView",
     .function = { .dmark = sv_mark, .dfree = sv_free, .dsize = sv_memsize, .dcompact = sv_compact },
     .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_EMBEDDABLE,
 };
 
-/* Forward declarations */
-static int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
+/* Forward declarations for functions defined later in this file */
 static long sv_char_count(string_view_t *sv);
 static long sv_char_to_byte_offset(string_view_t *sv, long char_idx);
 SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
 SV_INLINE int sv_is_utf8(string_view_t *sv);
 static long sv_utf8_char_count(const char *p, long len);
-
-/*
- * Initialize (or reinitialize) a string_view_t's fields from a frozen backing
- * string. Caller is responsible for freeing any prior stride_idx.
- */
-static void sv_init_fields(VALUE obj, string_view_t *sv, VALUE backing,
-                           const char *base, rb_encoding *enc,
-                           long offset, long length) {
-    RB_OBJ_WRITE(obj, &sv->backing, backing);
-    sv->base        = base;
-    sv->enc         = enc;
-    sv->offset      = offset;
-    sv->length      = length;
-    sv->single_byte = sv_compute_single_byte(backing, enc);
-    sv->charlen     = -1;
-    sv->stride_idx  = NULL;
-}
-
-/* ========================================================================= */
-/* StringView::Pool                                                          */
-/* ========================================================================= */
-
-static VALUE cStringViewPool;
-
-#define POOL_INITIAL_CAP 32
-#define POOL_MAX_GROW    4096
-
-typedef struct {
-    VALUE   backing;      /* frozen String that owns the bytes */
-    const char *base;     /* cached RSTRING_PTR(backing) */
-    rb_encoding *enc;     /* cached encoding */
-    int     single_byte;  /* cached single-byte flag */
-    long    backing_len;  /* cached RSTRING_LEN(backing) */
-    VALUE   views;        /* Ruby Array of pre-allocated StringView objects */
-    long    next_idx;     /* index of next available view in the array */
-    long    capacity;     /* current size of the views array */
-} sv_pool_t;
-
-static void pool_mark(void *ptr) {
-    sv_pool_t *pool = (sv_pool_t *)ptr;
-    if (pool->backing != Qnil)
-        rb_gc_mark_movable(pool->backing);
-    if (pool->views != Qnil)
-        rb_gc_mark_movable(pool->views);
-}
-
-static void pool_compact(void *ptr) {
-    sv_pool_t *pool = (sv_pool_t *)ptr;
-    if (pool->backing != Qnil) {
-        pool->backing = rb_gc_location(pool->backing);
-        pool->base = RSTRING_PTR(pool->backing);
-    }
-    if (pool->views != Qnil) {
-        pool->views = rb_gc_location(pool->views);
-    }
-}
-
-static size_t pool_memsize(const void *ptr) {
-    const sv_pool_t *pool = (const sv_pool_t *)ptr;
-    size_t size = sizeof(sv_pool_t);
-    /* Each pre-allocated view is a separate GC object with a string_view_t
-     * struct. Report their cost here so ObjectSpace.memsize_of gives a
-     * realistic picture of the pool's total footprint. */
-    size += (size_t)pool->capacity * sizeof(string_view_t);
-    return size;
-}
-
-static const rb_data_type_t pool_type = {
-    .wrap_struct_name = "StringView::Pool",
-    .function = { .dmark = pool_mark, .dfree = RUBY_DEFAULT_FREE,
-                  .dsize = pool_memsize, .dcompact = pool_compact },
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_EMBEDDABLE,
-};
-
-/*
- * Allocate a batch of StringView objects pre-initialized with the pool's
- * backing string. They start with offset=0, length=0 (empty views).
- * The `.view()` method sets the real offset+length before returning.
- */
-static void pool_grow(sv_pool_t *pool, VALUE pool_obj) {
-    long grow = pool->capacity == 0 ? POOL_INITIAL_CAP : pool->capacity;
-    if (grow > POOL_MAX_GROW) grow = POOL_MAX_GROW;
-    long new_cap = pool->capacity + grow;
-    long old_cap = pool->capacity;
-
-    /* Grow the Ruby Array to hold the new views */
-    for (long i = old_cap; i < new_cap; i++) {
-        string_view_t *sv;
-        VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
-                                         &string_view_type, sv);
-        sv_init_fields(obj, sv, pool->backing, pool->base, pool->enc, 0, 0);
-        rb_ary_push(pool->views, obj);
-    }
-
-    pool->capacity = new_cap;
-}
-
-/*
- * Pool.new(string) → Pool
- */
-static VALUE pool_initialize(VALUE self, VALUE str) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-
-    if (!RB_TYPE_P(str, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(str));
-    }
-
-    rb_str_freeze(str);
-
-    RB_OBJ_WRITE(self, &pool->backing, str);
-    pool->base        = RSTRING_PTR(str);
-    pool->enc         = rb_enc_get(str);
-    pool->single_byte = sv_compute_single_byte(str, pool->enc);
-    pool->backing_len = RSTRING_LEN(str);
-
-    /* Create the views array and pre-allocate the initial batch */
-    VALUE ary = rb_ary_new_capa(POOL_INITIAL_CAP);
-    RB_OBJ_WRITE(self, &pool->views, ary);
-    pool->next_idx = 0;
-    pool->capacity = 0;
-
-    pool_grow(pool, self);
-
-    return self;
-}
-
-static VALUE pool_alloc(VALUE klass) {
-    sv_pool_t *pool;
-    VALUE obj = TypedData_Make_Struct(klass, sv_pool_t, &pool_type, pool);
-    pool->backing     = Qnil;
-    pool->base        = NULL;
-    pool->enc         = NULL;
-    pool->single_byte = -1;
-    pool->backing_len = 0;
-    pool->views       = Qnil;
-    pool->next_idx    = 0;
-    pool->capacity    = 0;
-    return obj;
-}
-
-/*
- * pool.view(byte_offset, byte_length) → StringView
- *
- * Returns a pre-allocated StringView pointed at the given byte range.
- * If the pool is exhausted, grows exponentially before returning.
- */
-static VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    long off = NUM2LONG(voffset);
-    long len = NUM2LONG(vlength);
-
-    if (SV_UNLIKELY(off < 0 || len < 0 || off > pool->backing_len ||
-                     len > pool->backing_len - off)) {
-        rb_raise(rb_eArgError,
-                 "offset %ld, length %ld out of range for string of bytesize %ld",
-                 off, len, pool->backing_len);
-    }
-
-    /* Grow if exhausted */
-    if (SV_UNLIKELY(pool->next_idx >= pool->capacity)) {
-        pool_grow(pool, self);
-    }
-
-    /* Grab the next pre-allocated view and set its range */
-    VALUE view = RARRAY_AREF(pool->views, pool->next_idx);
-    pool->next_idx++;
-
-    string_view_t *sv = (string_view_t *)RTYPEDDATA_GET_DATA(view);
-    sv->offset  = off;
-    sv->length  = len;
-    sv->charlen = -1;           /* invalidate cached char count */
-    sv->stride_idx = NULL;      /* invalidate stride index */
-
-    return view;
-}
-
-/*
- * pool.size → Integer
- * Number of views handed out so far.
- */
-static VALUE pool_size(VALUE self) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    return LONG2NUM(pool->next_idx);
-}
-
-/*
- * pool.capacity → Integer
- * Current number of pre-allocated view slots.
- */
-static VALUE pool_capacity(VALUE self) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    return LONG2NUM(pool->capacity);
-}
-
-/*
- * pool.reset! → self
- * Reset the cursor to 0, allowing all pre-allocated views to be reused.
- * Previously returned views become invalid (their offsets may be overwritten).
- */
-static VALUE pool_reset(VALUE self) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    pool->next_idx = 0;
-    return self;
-}
-
-/*
- * pool.backing → String (frozen)
- */
-static VALUE pool_backing(VALUE self) {
-    sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    return pool->backing;
-}
 
 /* ========================================================================= */
 /* Internal helpers                                                          */
@@ -405,12 +155,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
 
     rb_scan_args(argc, argv, "12", &str, &voffset, &vlength);
 
-    if (!RB_TYPE_P(str, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(str));
-    }
-
+    sv_check_string(str);
     rb_str_freeze(str);
 
     long backing_len = RSTRING_LEN(str);
@@ -421,13 +166,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
     } else {
         offset = NUM2LONG(voffset);
         length = NUM2LONG(vlength);
-
-        if (offset < 0 || length < 0 || offset > backing_len ||
-            length > backing_len - offset) {
-            rb_raise(rb_eArgError,
-                     "offset %ld, length %ld out of range for string of bytesize %ld",
-                     offset, length, backing_len);
-        }
+        sv_check_bounds(offset, length, backing_len);
     }
 
     string_view_t *sv = sv_get_struct(self);
@@ -479,24 +218,12 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
-    if (!RB_TYPE_P(new_backing, T_STRING)) {
-        rb_raise(rb_eTypeError,
-                 "no implicit conversion of %s into String",
-                 rb_obj_classname(new_backing));
-    }
-
+    sv_check_string(new_backing);
     rb_str_freeze(new_backing);
 
     long off = NUM2LONG(voffset);
     long len = NUM2LONG(vlength);
-    long backing_len = RSTRING_LEN(new_backing);
-
-    if (off < 0 || len < 0 || off > backing_len ||
-        len > backing_len - off) {
-        rb_raise(rb_eArgError,
-                 "offset %ld, length %ld out of range for string of bytesize %ld",
-                 off, len, backing_len);
-    }
+    sv_check_bounds(off, len, RSTRING_LEN(new_backing));
 
     /* Free old stride index before reinitializing */
     if (sv->stride_idx) {
@@ -602,7 +329,7 @@ static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
  * For String arguments: native zero-alloc implementation using rb_memsearch.
  * For Regexp arguments: delegates to String#index via shared string.
  */
-static VALUE sv_index(int argc, VALUE *argv, VALUE self) {
+VALUE sv_index(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE pattern, voffset;
     rb_scan_args(argc, argv, "11", &pattern, &voffset);
@@ -658,7 +385,7 @@ static VALUE sv_index(int argc, VALUE *argv, VALUE self) {
  * For String arguments: native zero-alloc reverse search.
  * For Regexp arguments: delegates to String#rindex via shared string.
  */
-static VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
+VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE pattern, voffset;
     rb_scan_args(argc, argv, "11", &pattern, &voffset);
@@ -743,7 +470,7 @@ static VALUE sv_getbyte(VALUE self, VALUE vidx) {
  * For String arguments: native zero-alloc byte-level search.
  * For Regexp arguments: delegates to String#byteindex via shared string.
  */
-static VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
+VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE pattern, voffset;
     rb_scan_args(argc, argv, "11", &pattern, &voffset);
@@ -776,7 +503,7 @@ static VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
  * For String arguments: native zero-alloc reverse byte-level search.
  * For Regexp arguments: delegates to String#byterindex via shared string.
  */
-static VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
+VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     VALUE pattern, voffset;
     rb_scan_args(argc, argv, "11", &pattern, &voffset);
@@ -1114,7 +841,7 @@ static VALUE sv_hash(VALUE self) {
  * Compute single-byte flag from encoding + coderange.
  * Called once at construction time and cached in sv->single_byte.
  */
-static int sv_compute_single_byte(VALUE backing, rb_encoding *enc) {
+int sv_compute_single_byte(VALUE backing, rb_encoding *enc) {
     if (rb_enc_mbmaxlen(enc) == 1) return 1;
     int cr = ENC_CODERANGE(backing);
     if (cr == ENC_CODERANGE_7BIT) return 1;
@@ -1862,63 +1589,6 @@ static VALUE sv_frozen_error(int argc, VALUE *argv, VALUE self) {
 }
 
 /* ========================================================================= */
-/* StringView::Strict — raises WouldAllocate for any allocating method       */
-/* ========================================================================= */
-
-/*
- * Raise StringView::WouldAllocate with the method name.
- * Used for all methods on Strict that would create a String.
- */
-static VALUE sv_would_allocate(int argc, VALUE *argv, VALUE self) {
-    const char *method_name = rb_id2name(rb_frame_this_func());
-    rb_raise(eWouldAllocate,
-             "StringView::Strict#%s would allocate a String — "
-             "call .materialize to get a String, or .reset! to repoint the view",
-             method_name);
-    return Qnil;
-}
-
-/*
- * Strict versions of index/rindex/byteindex/byterindex:
- * String args work zero-alloc. Regexp args raise WouldAllocate.
- */
-static VALUE sv_strict_index(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#index with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_index(argc, argv, self);
-}
-
-static VALUE sv_strict_rindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#rindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_rindex(argc, argv, self);
-}
-
-static VALUE sv_strict_byteindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#byteindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_byteindex(argc, argv, self);
-}
-
-static VALUE sv_strict_byterindex(int argc, VALUE *argv, VALUE self) {
-    if (argc >= 1 && rb_obj_is_kind_of(argv[0], rb_cRegexp)) {
-        rb_raise(eWouldAllocate,
-                 "StringView::Strict#byterindex with Regexp would allocate a String — "
-                 "call .materialize to get a String, or .reset! to repoint the view");
-    }
-    return sv_byterindex(argc, argv, self);
-}
-
-/* ========================================================================= */
 /* Init                                                                      */
 /* ========================================================================= */
 
@@ -2071,82 +1741,6 @@ void Init_string_view(void) {
     rb_define_method(cStringView, "delete_prefix!", sv_frozen_error, -1);
     rb_define_method(cStringView, "delete_suffix!", sv_frozen_error, -1);
 
-    /* =================================================================== */
-    /* StringView::Strict                                                  */
-    /* =================================================================== */
-
-    eWouldAllocate = rb_define_class_under(cStringView, "WouldAllocate", rb_eRuntimeError);
-
-    cStringViewStrict = rb_define_class_under(cStringView, "Strict", cStringView);
-
-    /* Strict inherits everything from StringView (including alloc, initialize,
-     * all zero-copy methods, slicing, comparisons, etc.).
-     *
-     * Override only methods that would allocate a String object.
-     * to_s / materialize is the explicit escape hatch. */
-
-    /* Tier 3 transforms — all allocate a result String */
-    rb_define_method(cStringViewStrict, "upcase",      sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "downcase",    sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "capitalize",  sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "swapcase",    sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "reverse",     sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "squeeze",     sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "encode",      sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "gsub",        sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "sub",         sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "tr",          sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "tr_s",        sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "delete",      sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "scan",        sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "split",       sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "center",      sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "ljust",       sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "rjust",       sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "%",           sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "+",           sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "*",           sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "unpack1",     sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "scrub",       sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "unicode_normalize", sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "count",       sv_would_allocate, -1);
-
-    /* index/rindex/byteindex/byterindex: String args are zero-alloc,
-     * Regexp args raise WouldAllocate. */
-    rb_define_method(cStringViewStrict, "index",       sv_strict_index,       -1);
-    rb_define_method(cStringViewStrict, "rindex",      sv_strict_rindex,      -1);
-    rb_define_method(cStringViewStrict, "byteindex",   sv_strict_byteindex,   -1);
-    rb_define_method(cStringViewStrict, "byterindex",  sv_strict_byterindex,  -1);
-
-    /* Regex-based methods — always allocate */
-    rb_define_method(cStringViewStrict, "match",       sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "match?",      sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "=~",          sv_would_allocate, -1);
-
-    /* Iteration methods that yield/return Strings */
-    rb_define_method(cStringViewStrict, "each_char",   sv_would_allocate, -1);
-    rb_define_method(cStringViewStrict, "chars",       sv_would_allocate, -1);
-
-    /* Implicit coercion — would create a shared String */
-    rb_define_private_method(cStringViewStrict, "to_str", sv_would_allocate, -1);
-
-    /* inspect allocates a String (but we keep it — debugging is essential) */
-
-    /* to_s raises — Strict views act like frozen strings, not string sources.
-     * materialize is the EXPLICIT escape hatch (inherited from StringView,
-     * defined as a separate method pointing at sv_to_s). */
-    rb_define_method(cStringViewStrict, "to_s",  sv_would_allocate, -1);
-
-    /* =================================================================== */
-    /* StringView::Pool                                                    */
-    /* =================================================================== */
-
-    cStringViewPool = rb_define_class_under(cStringView, "Pool", rb_cObject);
-    rb_define_alloc_func(cStringViewPool, pool_alloc);
-    rb_define_method(cStringViewPool, "initialize", pool_initialize, 1);
-    rb_define_method(cStringViewPool, "view",       pool_view,       2);
-    rb_define_method(cStringViewPool, "size",       pool_size,       0);
-    rb_define_method(cStringViewPool, "capacity",   pool_capacity,   0);
-    rb_define_method(cStringViewPool, "reset!",     pool_reset,      0);
-    rb_define_method(cStringViewPool, "backing",    pool_backing,    0);
+    Init_string_view_strict();
+    Init_string_view_pool();
 }
