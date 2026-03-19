@@ -84,8 +84,7 @@ static void pool_grow(sv_pool_t *pool, VALUE pool_obj) {
  */
 static VALUE pool_initialize(VALUE self, VALUE str) {
     sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
-    sv_check_string(str);
-    rb_str_freeze(str);
+    sv_check_frozen_string(str);
 
     RB_OBJ_WRITE(self, &pool->backing, str);
     pool->base        = RSTRING_PTR(str);

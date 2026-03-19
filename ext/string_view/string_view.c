@@ -155,8 +155,7 @@ static VALUE sv_initialize(int argc, VALUE *argv, VALUE self) {
 
     rb_scan_args(argc, argv, "12", &str, &voffset, &vlength);
 
-    sv_check_string(str);
-    rb_str_freeze(str);
+    sv_check_frozen_string(str);
 
     long backing_len = RSTRING_LEN(str);
 
@@ -218,8 +217,7 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
-    sv_check_string(new_backing);
-    rb_str_freeze(new_backing);
+    sv_check_frozen_string(new_backing);
 
     long off = NUM2LONG(voffset);
     long len = NUM2LONG(vlength);

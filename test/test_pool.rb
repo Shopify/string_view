@@ -77,10 +77,9 @@ class TestStringViewPool < Minitest::Test
     assert_instance_of(StringView::Pool, pool)
   end
 
-  def test_new_freezes_backing
+  def test_new_requires_frozen_backing
     str = +"mutable"
-    StringView::Pool.new(str)
-    assert_predicate(str, :frozen?)
+    assert_raises(FrozenError) { StringView::Pool.new(str) }
   end
 
   def test_new_requires_string
@@ -391,7 +390,7 @@ class TestStringViewPool < Minitest::Test
   # ---------------------------------------------------------------------------
 
   def test_pool_survives_gc
-    pool = StringView::Pool.new(+"hello world")
+    pool = StringView::Pool.new("hello world")
     v = pool.view(0, 5)
     GC.start
     GC.start
@@ -502,7 +501,7 @@ class TestStringViewPool < Minitest::Test
   end
 
   def test_new_with_binary_string
-    str = "\x00\x01\xFF\xFE".b
+    str = "\x00\x01\xFF\xFE".b.freeze
     pool = StringView::Pool.new(str)
     v = pool.view(0, 4)
     assert_equal(Encoding::ASCII_8BIT, v.encoding)
@@ -987,7 +986,7 @@ class TestStringViewPool < Minitest::Test
   # ---------------------------------------------------------------------------
 
   def test_gc_during_pool_use
-    pool = StringView::Pool.new(+"test buffer for gc")
+    pool = StringView::Pool.new("test buffer for gc")
     views = []
     10.times do
       views << pool.view(0, 4)
@@ -997,7 +996,7 @@ class TestStringViewPool < Minitest::Test
   end
 
   def test_pool_and_views_survive_compaction
-    pool = StringView::Pool.new(+"compact me")
+    pool = StringView::Pool.new("compact me")
     v = pool.view(0, 7)
     GC.auto_compact = true
     GC.start

@@ -16,10 +16,9 @@ class TestStringView < Minitest::Test
     assert_instance_of(StringView, sv)
   end
 
-  def test_new_freezes_backing_string
+  def test_new_requires_frozen_backing
     str = +"mutable"
-    StringView.new(str)
-    assert_predicate(str, :frozen?)
+    assert_raises(FrozenError) { StringView.new(str) }
   end
 
   def test_new_with_frozen_string
@@ -132,12 +131,12 @@ class TestStringView < Minitest::Test
   end
 
   def test_encoding
-    sv = StringView.new("hello".encode("UTF-8"))
+    sv = StringView.new("hello".encode("UTF-8").freeze)
     assert_equal(Encoding::UTF_8, sv.encoding)
   end
 
   def test_encoding_preserves_source
-    str = "hello".encode("ASCII")
+    str = "hello".encode("ASCII").freeze
     sv = StringView.new(str)
     assert_equal(Encoding::US_ASCII, sv.encoding)
   end
@@ -875,7 +874,7 @@ class TestStringView < Minitest::Test
   end
 
   def test_valid_encoding_invalid
-    bad = "\xFF\xFE".b.force_encoding("UTF-8")
+    bad = "\xFF\xFE".b.force_encoding("UTF-8").freeze
     sv = StringView.new(bad)
     refute_predicate(sv, :valid_encoding?)
   end
@@ -1130,11 +1129,10 @@ class TestStringView < Minitest::Test
     assert_equal("goodbye", sv.to_s)
   end
 
-  def test_reset_freezes_new_backing
+  def test_reset_requires_frozen_backing
     sv = StringView.new("hello")
     new_backing = +"mutable string"
-    sv.reset!(new_backing, 0, 14)
-    assert_predicate(new_backing, :frozen?)
+    assert_raises(FrozenError) { sv.reset!(new_backing, 0, 14) }
   end
 
   def test_reset_with_offset_and_length
@@ -1202,7 +1200,7 @@ class TestStringView < Minitest::Test
 
   def test_scrub
     # Invalid UTF-8 byte sequence
-    bad = "hello \xFF world".b.force_encoding("UTF-8")
+    bad = "hello \xFF world".b.force_encoding("UTF-8").freeze
     sv = StringView.new(bad)
     result = sv.scrub("?")
     assert_instance_of(String, result)
@@ -1332,26 +1330,26 @@ class TestStringView < Minitest::Test
   # ---------------------------------------------------------------------------
 
   def test_binary_encoding
-    str = "\x00\x01\x02\xFF\xFE".b
+    str = "\x00\x01\x02\xFF\xFE".b.freeze
     sv = StringView.new(str)
     assert_equal(Encoding::ASCII_8BIT, sv.encoding)
   end
 
   def test_binary_bytesize
-    str = "\x00\x01\x02\xFF\xFE".b
+    str = "\x00\x01\x02\xFF\xFE".b.freeze
     sv = StringView.new(str)
     assert_equal(5, sv.bytesize)
   end
 
   def test_binary_length_equals_bytesize
-    str = "\x00\x01\x02\xFF\xFE".b
+    str = "\x00\x01\x02\xFF\xFE".b.freeze
     sv = StringView.new(str)
     # For binary encoding, char == byte
     assert_equal(sv.bytesize, sv.length)
   end
 
   def test_binary_getbyte
-    str = "\x00\x01\xFF".b
+    str = "\x00\x01\xFF".b.freeze
     sv = StringView.new(str)
     assert_equal(0, sv.getbyte(0))
     assert_equal(1, sv.getbyte(1))
@@ -1359,7 +1357,7 @@ class TestStringView < Minitest::Test
   end
 
   def test_binary_slice
-    str = "\x00\x01\x02\x03\x04\x05".b
+    str = "\x00\x01\x02\x03\x04\x05".b.freeze
     sv = StringView.new(str)
     result = sv[2, 3]
     assert_instance_of(StringView, result)
@@ -1367,14 +1365,14 @@ class TestStringView < Minitest::Test
   end
 
   def test_binary_include
-    str = "\x00\x01\x02\xFF\xFE".b
+    str = "\x00\x01\x02\xFF\xFE".b.freeze
     sv = StringView.new(str)
     assert_includes(sv, "\xFF".b)
     refute_includes(sv, "\xAA".b)
   end
 
   def test_binary_each_byte
-    str = "\x00\xFF".b
+    str = "\x00\xFF".b.freeze
     sv = StringView.new(str)
     bytes = []
     sv.each_byte { |b| bytes << b }
@@ -1586,7 +1584,7 @@ class TestStringView < Minitest::Test
   # ---------------------------------------------------------------------------
 
   def test_view_survives_gc_without_external_reference
-    sv = StringView.new(+"hello world")
+    sv = StringView.new("hello world")
     GC.start
     GC.start
     # View keeps backing alive — still works
@@ -1596,7 +1594,7 @@ class TestStringView < Minitest::Test
   end
 
   def test_multiple_views_into_same_backing
-    str = +"shared backing string"
+    str = "shared backing string"
     sv1 = StringView.new(str)
     sv2 = StringView.new(str, 7, 7) # "backing"
 

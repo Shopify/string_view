@@ -58,12 +58,17 @@ extern const rb_data_type_t string_view_type;
 /* Forward-declared helpers (defined in string_view.c) */
 int sv_compute_single_byte(VALUE backing, rb_encoding *enc);
 
-/* Validate that str is a T_STRING, raise TypeError otherwise. */
-SV_INLINE void sv_check_string(VALUE str) {
+/* Validate that str is a frozen T_STRING. Raises TypeError if not a
+ * String, FrozenError if not frozen. */
+SV_INLINE void sv_check_frozen_string(VALUE str) {
     if (SV_UNLIKELY(!RB_TYPE_P(str, T_STRING))) {
         rb_raise(rb_eTypeError,
                  "no implicit conversion of %s into String",
                  rb_obj_classname(str));
+    }
+    if (SV_UNLIKELY(!OBJ_FROZEN(str))) {
+        rb_raise(rb_eFrozenError,
+                 "string must be frozen; call .freeze before creating a view");
     }
 }
 

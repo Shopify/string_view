@@ -71,10 +71,11 @@ module StringView::SexpParser
       when String then source
       else source.to_s
       end
+      raw = raw.freeze
 
       case mode
       when :string
-        @source = raw.freeze
+        @source = raw
         @slicer = ->(off, len) { @source.byteslice(off, len) }
       when :string_view
         @source = StringView.new(raw)
