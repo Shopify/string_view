@@ -178,7 +178,9 @@ class TestStringMethodCoverage < Minitest::Test
 
   def test_all_string_methods_accounted_for
     # All public methods on String that aren't from Object/Kernel/Comparable
-    string_methods = String.instance_methods - Object.instance_methods - Comparable.instance_methods
+    # Exclude methods added by StringView::CoreExt (our own monkeypatch)
+    string_methods = String.instance_methods - Object.instance_methods - Comparable.instance_methods -
+      StringView::CoreExt.instance_methods
 
     accounted_for = IMPLEMENTED + OPERATORS + FROZEN_BANG_METHODS + NOT_IMPLEMENTED
 

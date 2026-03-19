@@ -1743,4 +1743,5 @@ void Init_string_view(void) {
 
     Init_string_view_strict();
     Init_string_view_pool();
+    Init_string_view_core_ext();
 }

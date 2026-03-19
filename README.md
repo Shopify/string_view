@@ -202,6 +202,26 @@ sv.reset!(new_data, 0, new_data.bytesize)
 sv.to_s  # => "different content"
 ```
 
+### `String#view` (core extension)
+
+For convenience, you can add a `view` method directly to `String` via an opt-in require:
+
+```ruby
+require "string_view/core_ext"
+
+buf = "Hello, world! This is a large buffer."
+greeting = buf.view(0, 5)      # => StringView "Hello"
+name = buf.view(7, 5)          # => StringView "world"
+```
+
+This includes the `StringView::CoreExt` module into `String`. The `view` method takes a byte offset and byte length, and returns a `StringView` backed by a pool that is lazily created and cached per string. Subsequent `view` calls on the same string reuse the pool, amortizing allocation cost.
+
+Calling `view` implicitly freezes the string. This is required because StringView holds a direct pointer into the string's memory — if the string were mutated or resized, all views would be invalidated.
+
+The pool cache uses an `ObjectSpace::WeakKeyMap` internally, so pools are automatically cleaned up when the string is garbage collected.
+
+This require is opt-in — `require "string_view"` alone never modifies `String`.
+
 ## Internals
 
 ### Struct layout
