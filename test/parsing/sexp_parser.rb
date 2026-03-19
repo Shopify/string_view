@@ -239,9 +239,9 @@ module StringView::SexpParser
         @tokens << if span.include?(".")
           Token.new(type: :float, value: span.to_f, byte_offset: start, byte_length: span.bytesize)
         else
-          @tokens << Token.new(type: :integer, value: span.to_i, byte_offset: start, byte_length: span.bytesize)
-        end
           Token.new(type: :integer, value: span.to_i, byte_offset: start, byte_length: span.bytesize)
+        end
+        return
       end
 
       @tokens << Token.new(type: :symbol, value: span, byte_offset: start, byte_length: span.bytesize)
@@ -314,9 +314,9 @@ module StringView::SexpParser
 
       while @pos < @tokens.length
         break if @tokens[@pos].type == :rparen
+
         elements << parse_expr
       end
-
 
       raise "Unterminated list — expected ')'" if @pos >= @tokens.length
 
