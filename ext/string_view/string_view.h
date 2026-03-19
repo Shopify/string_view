@@ -45,6 +45,7 @@ typedef struct {
 /* Global class/error VALUE variables */
 extern VALUE cStringView;
 extern VALUE cStringViewStrict;
+extern VALUE cStringViewPool;
 extern VALUE eWouldAllocate;
 
 /* TypedData descriptor */
@@ -104,8 +105,12 @@ VALUE sv_rindex(int argc, VALUE *argv, VALUE self);
 VALUE sv_byteindex(int argc, VALUE *argv, VALUE self);
 VALUE sv_byterindex(int argc, VALUE *argv, VALUE self);
 
+/* Pool view (defined in string_view_pool.c, used by core_ext) */
+VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength);
+
 /* Init functions for submodules */
 void Init_string_view_strict(void);
 void Init_string_view_pool(void);
+void Init_string_view_core_ext(void);
 
 #endif /* STRING_VIEW_H */

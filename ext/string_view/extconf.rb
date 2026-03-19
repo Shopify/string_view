@@ -9,7 +9,7 @@ $CFLAGS << " -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter"
 $CXXFLAGS = " -std=c++17 -O3 -DNDEBUG"
 
 # Tell mkmf about our source files (C and C++ mixed)
-$srcs = ["string_view.c", "string_view_strict.c", "string_view_pool.c", "simdutf.cpp"]
+$srcs = ["string_view.c", "string_view_strict.c", "string_view_pool.c", "string_view_core_ext.c", "simdutf.cpp"]
 $INCFLAGS << " -I$(srcdir)"
 
 create_makefile("string_view/string_view")

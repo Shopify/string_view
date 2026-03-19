@@ -4,7 +4,7 @@
 /* StringView::Pool                                                          */
 /* ========================================================================= */
 
-static VALUE cStringViewPool;
+VALUE cStringViewPool;
 
 #define POOL_INITIAL_CAP 32
 #define POOL_MAX_GROW    4096
@@ -124,8 +124,14 @@ static VALUE pool_alloc(VALUE klass) {
  * Returns a pre-allocated StringView pointed at the given byte range.
  * If the pool is exhausted, grows exponentially before returning.
  */
-static VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
+VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
     sv_pool_t *pool = (sv_pool_t *)RTYPEDDATA_GET_DATA(self);
+
+    /* Refresh cached base/len from the live backing string so that views
+     * created after a mutation always see the current buffer pointer. */
+    pool->base        = RSTRING_PTR(pool->backing);
+    pool->backing_len = RSTRING_LEN(pool->backing);
+
     long off = NUM2LONG(voffset);
     long len = NUM2LONG(vlength);
 
@@ -141,6 +147,7 @@ static VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
     pool->next_idx++;
 
     string_view_t *sv = (string_view_t *)RTYPEDDATA_GET_DATA(view);
+    sv->base    = pool->base;   /* refresh in case backing was mutated */
     sv->offset  = off;
     sv->length  = len;
     sv->charlen = -1;           /* invalidate cached char count */
