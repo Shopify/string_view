@@ -28,6 +28,7 @@ Style/RedundantRegexpArgument:
 Metrics/BlockNesting:
   Exclude:
     - bench/**/*.rb
+    - test/**/*.rb
 
 # `def self.method` is clear and common in parser modules.
 Style/ClassMethodsDefinitions:
@@ -41,4 +42,13 @@ Minitest/AssertTruthy:
 # assert_equal(false, x) tests for literal boolean false.
 # refute(x) would pass for nil, which is wrong here.
 Minitest/RefuteFalse:
+  Enabled: false
+
+Minitest/AssertIncludes:
+  Enabled: false
+
+Minitest/RefuteIncludes:
+  Enabled: false
+
+Style/Strip:
   Enabled: false
