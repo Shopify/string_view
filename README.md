@@ -39,6 +39,7 @@ StringView methods are organized into three tiers based on their allocation beha
 
 ### Design decisions
 
+- **Backing strings must be frozen.** `StringView.new`, `reset!`, and `Pool.new` all raise `FrozenError` if the string is not already frozen. This guarantees the backing bytes cannot be mutated or reallocated while views point into them. Use `String#view` (via `require "string_view/core_ext"`) if you want automatic freezing.
 - **`to_str` is private.** Ruby's internal coercion protocol (`rb_check_string_type`) ignores method visibility, so StringView works seamlessly with `Regexp#=~`, string interpolation, and `String#+`. But `respond_to?(:to_str)` returns `false`, so code that explicitly checks for string-like objects won't treat StringView as a drop-in String replacement. When coercion happens, it returns a frozen shared string (zero-copy for heap-allocated backings).
 - **All bang methods raise `FrozenError`.** StringView is immutable — `upcase!`, `gsub!`, `slice!`, etc. all raise immediately.
 - **`method_missing` is a safety net.** Any String method not yet implemented natively raises `NotImplementedError` with a message telling you to call `.to_s.method_name(...)` explicitly. No silent fallback.
@@ -151,7 +152,7 @@ The gem includes a C extension that compiles during installation. It requires Ru
 ```ruby
 require "string_view"
 
-# Create from a String (freezes the backing automatically)
+# Create from a frozen String
 sv = StringView.new("Hello, world!")
 
 # Slicing returns StringView — zero copy
@@ -179,7 +180,7 @@ sv.split(", ")             # => ["Hello", "world!"] (Array of Strings)
 
 ```ruby
 # Simulate a large HTTP response or log chunk
-buffer = File.read("large_file.txt")
+buffer = File.read("large_file.txt").freeze
 sv = StringView.new(buffer)
 
 # Extract fields without copying the entire buffer
@@ -196,7 +197,7 @@ body.match?(/\d{4}-\d{2}-\d{2}/)       # Regex on the view
 ```ruby
 sv = StringView.new("initial content")
 
-# Re-point at a different backing string
+# Re-point at a different (frozen) backing string
 new_data = "different content"
 sv.reset!(new_data, 0, new_data.bytesize)
 sv.to_s  # => "different content"
@@ -250,7 +251,7 @@ For UTF-8 strings with actual multibyte content, StringView uses two techniques:
 
 ### Compilation
 
-The extension is compiled with `-O3` and uses `__attribute__((always_inline))` on hot paths, `RTYPEDDATA_GET_DATA` for fast struct access (skipping type checks), and `FL_SET_RAW` for freeze (bypassing method dispatch).
+The extension is compiled with `-O3` and uses `__attribute__((always_inline))` on hot paths and `RTYPEDDATA_GET_DATA` for fast struct access (skipping type checks).
 
 ## Development
 
