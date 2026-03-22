@@ -52,3 +52,7 @@ Minitest/RefuteIncludes:
 
 Style/Strip:
   Enabled: false
+
+Style/RedundantFreeze:
+  Exclude:
+    - test/**/*.rb
