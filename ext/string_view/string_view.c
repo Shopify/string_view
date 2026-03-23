@@ -723,6 +723,11 @@ typedef struct {
     char *ptr;
 } sv_cstr_t;
 
+typedef struct {
+    sv_cstr_t *cs;
+    int base;
+} sv_inum_args_t;
+
 SV_INLINE void sv_cstr_init(sv_cstr_t *cs, string_view_t *sv) {
     const char *p = sv_ptr(sv);
     long len = sv->length;
@@ -743,6 +748,22 @@ SV_INLINE void sv_cstr_free(sv_cstr_t *cs) {
     }
 }
 
+static VALUE sv_cstr_free_ensure(VALUE arg) {
+    sv_cstr_free((sv_cstr_t *)arg);
+    return Qnil;
+}
+
+static VALUE sv_to_i_body(VALUE arg) {
+    sv_inum_args_t *args = (sv_inum_args_t *)arg;
+    return rb_cstr_to_inum(args->cs->ptr, args->base, 0);
+}
+
+static VALUE sv_to_f_body(VALUE arg) {
+    sv_cstr_t *cs = (sv_cstr_t *)arg;
+    double d = rb_cstr_to_dbl(cs->ptr, 0);
+    return DBL2NUM(d);
+}
+
 /*
  * to_i([base]) — parse integer directly from byte pointer, zero allocations.
  * Uses rb_cstr_to_inum which parses from a NUL-terminated C string.
@@ -753,10 +774,12 @@ static VALUE sv_to_i(int argc, VALUE *argv, VALUE self) {
     if (argc > 0) base = NUM2INT(argv[0]);
 
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, base, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = base;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -766,9 +789,8 @@ static VALUE sv_to_f(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
     sv_cstr_init(&cs, sv);
-    double d = rb_cstr_to_dbl(cs.ptr, 0);
-    sv_cstr_free(&cs);
-    return DBL2NUM(d);
+    return rb_ensure(sv_to_f_body, (VALUE)&cs,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -777,10 +799,12 @@ static VALUE sv_to_f(VALUE self) {
 static VALUE sv_hex(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, 16, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = 16;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -789,10 +813,12 @@ static VALUE sv_hex(VALUE self) {
 static VALUE sv_oct(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, 8, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = 8;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /* ========================================================================= */
