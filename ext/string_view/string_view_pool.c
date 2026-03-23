@@ -73,6 +73,7 @@ static void pool_grow(sv_pool_t *pool, VALUE pool_obj) {
         VALUE obj = TypedData_Make_Struct(cStringView, string_view_t,
                                          &string_view_type, sv);
         sv_init_fields(obj, sv, pool->backing, pool->base, pool->enc, 0, 0);
+        sv->pooled = 1;
         rb_ary_push(pool->views, obj);
     }
 
@@ -145,12 +146,15 @@ VALUE pool_view(VALUE self, VALUE voffset, VALUE vlength) {
     VALUE view = RARRAY_AREF(pool->views, pool->next_idx);
     pool->next_idx++;
 
+    if (SV_UNLIKELY(OBJ_FROZEN(view))) {
+        rb_raise(rb_eFrozenError,
+                 "can't reuse a frozen pooled StringView; materialize it before freezing");
+    }
+
     string_view_t *sv = (string_view_t *)RTYPEDDATA_GET_DATA(view);
-    sv->base    = pool->base;   /* refresh in case backing was mutated */
-    sv->offset  = off;
-    sv->length  = len;
-    sv->charlen = -1;           /* invalidate cached char count */
-    sv->stride_idx = NULL;      /* invalidate stride index */
+    sv_clear_stride_index(sv);
+    sv_init_fields(view, sv, pool->backing, pool->base, pool->enc, off, len);
+    sv->pooled = 1;
 
     return view;
 }

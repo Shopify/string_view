@@ -50,10 +50,7 @@ static void sv_compact(void *ptr) {
 
 static void sv_free(void *ptr) {
     string_view_t *sv = (string_view_t *)ptr;
-    if (sv->stride_idx) {
-        xfree(sv->stride_idx->offsets);
-        xfree(sv->stride_idx);
-    }
+    sv_clear_stride_index(sv);
 }
 
 static size_t sv_memsize(const void *ptr) {
@@ -119,6 +116,7 @@ SV_INLINE VALUE sv_new_from_parent_obj(VALUE parent_obj, string_view_t *parent, 
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = parent->single_byte;
+    sv->pooled      = 0;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
     /* Not frozen — see sv_initialize comment for rationale */
@@ -140,6 +138,7 @@ static VALUE sv_alloc(VALUE klass) {
     sv->offset      = 0;
     sv->length      = 0;
     sv->single_byte = -1;
+    sv->pooled      = 0;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
     return obj;
@@ -217,6 +216,11 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
+    if (SV_UNLIKELY(sv->pooled)) {
+        rb_raise(rb_eRuntimeError,
+                 "can't reset a pooled StringView directly; call StringView::Pool#reset! instead");
+    }
+
     sv_check_frozen_string(new_backing);
 
     long off = NUM2LONG(voffset);
@@ -224,10 +228,7 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv_check_bounds(off, len, RSTRING_LEN(new_backing));
 
     /* Free old stride index before reinitializing */
-    if (sv->stride_idx) {
-        xfree(sv->stride_idx->offsets);
-        xfree(sv->stride_idx);
-    }
+    sv_clear_stride_index(sv);
 
     sv_init_fields(self, sv, new_backing, RSTRING_PTR(new_backing),
                    rb_enc_get(new_backing), off, len);
