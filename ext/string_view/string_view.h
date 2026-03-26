@@ -39,6 +39,8 @@ typedef struct {
     long   length;      /* byte length of this view */
     long   charlen;     /* cached character count; -1 = not yet computed */
     int    single_byte; /* cached: 1 if char==byte (ASCII/single-byte enc), 0 if multibyte, -1 unknown */
+    int    valid_encoding; /* cached slice validity: 1 valid, 0 invalid, -1 unknown */
+    int    pooled;      /* 1 if owned by StringView::Pool and subject to reuse */
     stride_index_t *stride_idx; /* lazily built stride index for multibyte, NULL if not built */
 } string_view_t;
 
@@ -83,6 +85,14 @@ SV_INLINE void sv_check_bounds(long off, long len, long backing_len) {
     }
 }
 
+SV_INLINE void sv_clear_stride_index(string_view_t *sv) {
+    if (sv->stride_idx) {
+        xfree(sv->stride_idx->offsets);
+        xfree(sv->stride_idx);
+        sv->stride_idx = NULL;
+    }
+}
+
 /*
  * Initialize (or reinitialize) a string_view_t's fields from a frozen backing
  * string. Caller is responsible for freeing any prior stride_idx.
@@ -96,6 +106,8 @@ SV_INLINE void sv_init_fields(VALUE obj, string_view_t *sv, VALUE backing,
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = sv_compute_single_byte(backing, enc);
+    sv->valid_encoding = sv->single_byte == 1 ? 1 : -1;
+    sv->pooled      = 0;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
 }

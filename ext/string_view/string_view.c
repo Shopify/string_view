@@ -50,10 +50,7 @@ static void sv_compact(void *ptr) {
 
 static void sv_free(void *ptr) {
     string_view_t *sv = (string_view_t *)ptr;
-    if (sv->stride_idx) {
-        xfree(sv->stride_idx->offsets);
-        xfree(sv->stride_idx);
-    }
+    sv_clear_stride_index(sv);
 }
 
 static size_t sv_memsize(const void *ptr) {
@@ -74,7 +71,9 @@ const rb_data_type_t string_view_type = {
 /* Forward declarations for functions defined later in this file */
 static long sv_char_count(string_view_t *sv);
 static long sv_char_to_byte_offset(string_view_t *sv, long char_idx);
+static long sv_char_count_partial(string_view_t *sv, const char *p, long len);
 SV_INLINE int sv_single_byte_optimizable(string_view_t *sv);
+SV_INLINE int sv_is_7bit(string_view_t *sv);
 SV_INLINE int sv_is_utf8(string_view_t *sv);
 static long sv_utf8_char_count(const char *p, long len);
 
@@ -119,6 +118,8 @@ SV_INLINE VALUE sv_new_from_parent_obj(VALUE parent_obj, string_view_t *parent, 
     sv->offset      = offset;
     sv->length      = length;
     sv->single_byte = parent->single_byte;
+    sv->valid_encoding = sv->single_byte == 1 ? 1 : -1;
+    sv->pooled      = 0;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
     /* Not frozen — see sv_initialize comment for rationale */
@@ -140,6 +141,8 @@ static VALUE sv_alloc(VALUE klass) {
     sv->offset      = 0;
     sv->length      = 0;
     sv->single_byte = -1;
+    sv->valid_encoding = -1;
+    sv->pooled      = 0;
     sv->charlen     = -1;
     sv->stride_idx  = NULL;
     return obj;
@@ -217,6 +220,11 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     rb_check_frozen(self);
     string_view_t *sv = sv_get_struct(self);
 
+    if (SV_UNLIKELY(sv->pooled)) {
+        rb_raise(rb_eRuntimeError,
+                 "can't reset a pooled StringView directly; call StringView::Pool#reset! instead");
+    }
+
     sv_check_frozen_string(new_backing);
 
     long off = NUM2LONG(voffset);
@@ -224,10 +232,7 @@ static VALUE sv_reset(VALUE self, VALUE new_backing, VALUE voffset, VALUE vlengt
     sv_check_bounds(off, len, RSTRING_LEN(new_backing));
 
     /* Free old stride index before reinitializing */
-    if (sv->stride_idx) {
-        xfree(sv->stride_idx->offsets);
-        xfree(sv->stride_idx);
-    }
+    sv_clear_stride_index(sv);
 
     sv_init_fields(self, sv, new_backing, RSTRING_PTR(new_backing),
                    rb_enc_get(new_backing), off, len);
@@ -274,6 +279,94 @@ static VALUE sv_ascii_only_p(VALUE self) {
     return Qtrue;
 }
 
+SV_INLINE long sv_precise_char_len(const char *p, const char *e, rb_encoding *enc) {
+    int len = rb_enc_precise_mbclen(p, e, enc);
+    if (MBCLEN_CHARFOUND_P(len)) return MBCLEN_CHARFOUND_LEN(len);
+    return 1;
+}
+
+static int sv_compute_valid_encoding_slice(string_view_t *sv) {
+    if (sv_single_byte_optimizable(sv)) return 1;
+
+    if (SV_LIKELY(sv_is_utf8(sv))) {
+        return simdutf_validate_utf8(sv_ptr(sv), (size_t)sv->length) ? 1 : 0;
+    }
+
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
+
+    while (p < e) {
+        int len = rb_enc_precise_mbclen(p, e, enc);
+        if (!MBCLEN_CHARFOUND_P(len)) return 0;
+        p += MBCLEN_CHARFOUND_LEN(len);
+    }
+
+    return 1;
+}
+
+SV_INLINE int sv_valid_encoding_cached(string_view_t *sv) {
+    if (SV_LIKELY(sv->valid_encoding >= 0)) return sv->valid_encoding;
+    sv->valid_encoding = sv_compute_valid_encoding_slice(sv);
+    return sv->valid_encoding;
+}
+
+static long sv_tolerant_char_count(const char *p, const char *e, rb_encoding *enc) {
+    long count = 0;
+
+    while (p < e) {
+        p += sv_precise_char_len(p, e, enc);
+        count++;
+    }
+
+    return count;
+}
+
+static long sv_tolerant_char_to_byte_offset(string_view_t *sv, long char_idx) {
+    rb_encoding *enc = sv_enc(sv);
+    const char *p = sv_ptr(sv);
+    const char *e = p + sv->length;
+    const char *start = p;
+    long i = 0;
+
+    while (i < char_idx && p < e) {
+        p += sv_precise_char_len(p, e, enc);
+        i++;
+    }
+
+    if (i < char_idx) return -1;
+    return p - start;
+}
+
+static long sv_tolerant_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
+    rb_encoding *enc = sv_enc(sv);
+    const char *start = sv_ptr(sv) + byte_off;
+    const char *p = start;
+    const char *e = sv_ptr(sv) + sv->length;
+    long i = 0;
+
+    while (i < n && p < e) {
+        p += sv_precise_char_len(p, e, enc);
+        i++;
+    }
+
+    return p - start;
+}
+
+SV_INLINE void sv_check_compatible_string(string_view_t *sv, VALUE other) {
+    rb_encoding *oenc = rb_enc_get(other);
+
+    if (sv->enc == oenc) return;
+    if (rb_enc_asciicompat(sv->enc) && rb_enc_asciicompat(oenc) &&
+        (sv_is_7bit(sv) || rb_enc_str_asciionly_p(other))) {
+        return;
+    }
+
+    rb_raise(rb_eEncCompatError,
+             "incompatible character encodings: %s and %s",
+             rb_enc_name(sv->enc), rb_enc_name(oenc));
+}
+
 /* ========================================================================= */
 /* Tier 1: Searching                                                         */
 /* ========================================================================= */
@@ -284,6 +377,7 @@ static VALUE sv_include_p(VALUE self, VALUE substr) {
     const char *p = sv_ptr(sv);
     long slen = RSTRING_LEN(substr);
     if (slen == 0) return Qtrue;
+    sv_check_compatible_string(sv, substr);
     if (slen > sv->length) return Qfalse;
 
     long pos = rb_memsearch(RSTRING_PTR(substr), slen, p, sv->length, sv_enc(sv));
@@ -299,6 +393,8 @@ static VALUE sv_start_with_p(int argc, VALUE *argv, VALUE self) {
         VALUE prefix = argv[i];
         StringValue(prefix);
         long plen = RSTRING_LEN(prefix);
+        if (plen == 0) return Qtrue;
+        sv_check_compatible_string(sv, prefix);
         if (plen > sv->length) continue;
         if (memcmp(p, RSTRING_PTR(prefix), plen) == 0) return Qtrue;
     }
@@ -314,6 +410,8 @@ static VALUE sv_end_with_p(int argc, VALUE *argv, VALUE self) {
         VALUE suffix = argv[i];
         StringValue(suffix);
         long slen = RSTRING_LEN(suffix);
+        if (slen == 0) return Qtrue;
+        sv_check_compatible_string(sv, suffix);
         if (slen > sv->length) continue;
         if (memcmp(p + sv->length - slen, RSTRING_PTR(suffix), slen) == 0)
             return Qtrue;
@@ -348,12 +446,13 @@ VALUE sv_index(int argc, VALUE *argv, VALUE self) {
 
     if (char_off < 0) char_off += total_chars;
     if (char_off < 0 || char_off > total_chars) return Qnil;
+    if (plen == 0) return LONG2NUM(char_off);
+    sv_check_compatible_string(sv, pattern);
 
     /* Convert char offset to byte offset */
     long byte_off = sv_char_to_byte_offset(sv, char_off);
     if (byte_off < 0) return Qnil;
 
-    if (plen == 0) return LONG2NUM(char_off);
     if (plen > sv->length - byte_off) return Qnil;
 
     long pos = rb_memsearch(RSTRING_PTR(pattern), plen,
@@ -365,16 +464,8 @@ VALUE sv_index(int argc, VALUE *argv, VALUE self) {
     if (sv_single_byte_optimizable(sv)) {
         return LONG2NUM(char_off + pos);
     }
-    /* Count chars from byte_off to byte_off+pos */
-    if (sv_is_utf8(sv)) {
-        long chars = sv_utf8_char_count(p + byte_off, pos);
-        return LONG2NUM(char_off + chars);
-    }
-    rb_encoding *enc = sv_enc(sv);
-    const char *s = p + byte_off;
-    const char *e = s + pos;
-    long chars = rb_enc_strlen(s, e, enc);
-    return LONG2NUM(char_off + chars);
+
+    return LONG2NUM(char_off + sv_char_count_partial(sv, p + byte_off, pos));
 }
 
 /*
@@ -413,6 +504,7 @@ VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
     if (plen == 0) {
         return LONG2NUM(max_char > total_chars ? total_chars : max_char);
     }
+    sv_check_compatible_string(sv, pattern);
     if (plen > sv->length) return Qnil;
 
     /* Convert max_char to a byte limit */
@@ -435,11 +527,7 @@ VALUE sv_rindex(int argc, VALUE *argv, VALUE self) {
             if (sv_single_byte_optimizable(sv)) {
                 return LONG2NUM(byte_pos);
             }
-            if (sv_is_utf8(sv)) {
-                return LONG2NUM(sv_utf8_char_count(p, byte_pos));
-            }
-            rb_encoding *enc = sv_enc(sv);
-            return LONG2NUM(rb_enc_strlen(p, s, enc));
+            return LONG2NUM(sv_char_count_partial(sv, p, byte_pos));
         }
         /* Move back one character */
         if (s == p) break;
@@ -486,6 +574,7 @@ VALUE sv_byteindex(int argc, VALUE *argv, VALUE self) {
     if (byte_off < 0) byte_off += sv->length;
     if (byte_off < 0 || byte_off > sv->length) return Qnil;
     if (plen == 0) return LONG2NUM(byte_off);
+    sv_check_compatible_string(sv, pattern);
     if (plen > sv->length - byte_off) return Qnil;
 
     long pos = rb_memsearch(RSTRING_PTR(pattern), plen,
@@ -526,6 +615,7 @@ VALUE sv_byterindex(int argc, VALUE *argv, VALUE self) {
     }
 
     if (plen == 0) return LONG2NUM(max_byte > sv->length ? sv->length : max_byte);
+    sv_check_compatible_string(sv, pattern);
     if (plen > sv->length) return Qnil;
 
     long search_end = max_byte;
@@ -633,6 +723,11 @@ typedef struct {
     char *ptr;
 } sv_cstr_t;
 
+typedef struct {
+    sv_cstr_t *cs;
+    int base;
+} sv_inum_args_t;
+
 SV_INLINE void sv_cstr_init(sv_cstr_t *cs, string_view_t *sv) {
     const char *p = sv_ptr(sv);
     long len = sv->length;
@@ -653,6 +748,22 @@ SV_INLINE void sv_cstr_free(sv_cstr_t *cs) {
     }
 }
 
+static VALUE sv_cstr_free_ensure(VALUE arg) {
+    sv_cstr_free((sv_cstr_t *)arg);
+    return Qnil;
+}
+
+static VALUE sv_to_i_body(VALUE arg) {
+    sv_inum_args_t *args = (sv_inum_args_t *)arg;
+    return rb_cstr_to_inum(args->cs->ptr, args->base, 0);
+}
+
+static VALUE sv_to_f_body(VALUE arg) {
+    sv_cstr_t *cs = (sv_cstr_t *)arg;
+    double d = rb_cstr_to_dbl(cs->ptr, 0);
+    return DBL2NUM(d);
+}
+
 /*
  * to_i([base]) — parse integer directly from byte pointer, zero allocations.
  * Uses rb_cstr_to_inum which parses from a NUL-terminated C string.
@@ -663,10 +774,12 @@ static VALUE sv_to_i(int argc, VALUE *argv, VALUE self) {
     if (argc > 0) base = NUM2INT(argv[0]);
 
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, base, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = base;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -676,9 +789,8 @@ static VALUE sv_to_f(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
     sv_cstr_init(&cs, sv);
-    double d = rb_cstr_to_dbl(cs.ptr, 0);
-    sv_cstr_free(&cs);
-    return DBL2NUM(d);
+    return rb_ensure(sv_to_f_body, (VALUE)&cs,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -687,10 +799,12 @@ static VALUE sv_to_f(VALUE self) {
 static VALUE sv_hex(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, 16, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = 16;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /*
@@ -699,10 +813,12 @@ static VALUE sv_hex(VALUE self) {
 static VALUE sv_oct(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
     sv_cstr_t cs;
+    sv_inum_args_t args;
     sv_cstr_init(&cs, sv);
-    VALUE result = rb_cstr_to_inum(cs.ptr, 8, 0);
-    sv_cstr_free(&cs);
-    return result;
+    args.cs = &cs;
+    args.base = 8;
+    return rb_ensure(sv_to_i_body, (VALUE)&args,
+                     sv_cstr_free_ensure, (VALUE)&cs);
 }
 
 /* ========================================================================= */
@@ -714,11 +830,10 @@ static VALUE sv_oct(VALUE self) {
  * Uses the single_byte cache when available.
  */
 SV_INLINE int sv_is_7bit(string_view_t *sv) {
-    if (sv_single_byte_optimizable(sv)) return 1;
-    const char *p = sv_ptr(sv);
+    const unsigned char *p = (const unsigned char *)sv_ptr(sv);
     long i;
     for (i = 0; i < sv->length; i++) {
-        if ((unsigned char)p[i] > 127) return 0;
+        if (p[i] > 127) return 0;
     }
     return 1;
 }
@@ -1008,22 +1123,11 @@ static long sv_char_to_byte_offset(string_view_t *sv, long char_idx) {
         return char_idx;
     }
 
-    if (SV_LIKELY(sv_is_utf8(sv))) {
+    if (SV_LIKELY(sv_is_utf8(sv)) && sv_valid_encoding_cached(sv)) {
         return sv_utf8_char_to_byte_offset_indexed(sv, char_idx);
     }
 
-    rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv);
-    const char *e = p + sv->length;
-    const char *start = p;
-    long i;
-
-    for (i = 0; i < char_idx && p < e; i++) {
-        p += rb_enc_fast_mbclen(p, e, enc);
-    }
-
-    if (i < char_idx) return -1;
-    return p - start;
+    return sv_tolerant_char_to_byte_offset(sv, char_idx);
 }
 
 static long sv_char_count(string_view_t *sv) {
@@ -1033,12 +1137,11 @@ static long sv_char_count(string_view_t *sv) {
     long count;
     if (sv_single_byte_optimizable(sv)) {
         count = sv->length;
-    } else if (SV_LIKELY(sv_is_utf8(sv))) {
+    } else if (SV_LIKELY(sv_is_utf8(sv)) && sv_valid_encoding_cached(sv)) {
         count = sv_utf8_char_count(sv_ptr(sv), sv->length);
     } else {
-        rb_encoding *enc = sv_enc(sv);
-        const char *p = sv_ptr(sv);
-        count = rb_enc_strlen(p, p + sv->length, enc);
+        count = sv_tolerant_char_count(sv_ptr(sv), sv_ptr(sv) + sv->length,
+                                       sv_enc(sv));
     }
 
     sv->charlen = count;
@@ -1051,20 +1154,20 @@ static long sv_chars_to_bytes(string_view_t *sv, long byte_off, long n) {
         return n < remaining ? n : remaining;
     }
 
-    if (SV_LIKELY(sv_is_utf8(sv))) {
+    if (SV_LIKELY(sv_is_utf8(sv)) && sv_valid_encoding_cached(sv)) {
         return sv_utf8_chars_to_bytes(sv_ptr(sv), sv->length, byte_off, n);
     }
 
-    rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv) + byte_off;
-    const char *e = sv_ptr(sv) + sv->length;
-    long i;
-    const char *start = p;
+    return sv_tolerant_chars_to_bytes(sv, byte_off, n);
+}
 
-    for (i = 0; i < n && p < e; i++) {
-        p += rb_enc_fast_mbclen(p, e, enc);
+static long sv_char_count_partial(string_view_t *sv, const char *p, long len) {
+    if (len <= 0) return 0;
+    if (sv_single_byte_optimizable(sv)) return len;
+    if (SV_LIKELY(sv_is_utf8(sv)) && sv_valid_encoding_cached(sv)) {
+        return sv_utf8_char_count(p, len);
     }
-    return p - start;
+    return sv_tolerant_char_count(p, p + len, sv_enc(sv));
 }
 
 static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
@@ -1159,6 +1262,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
         if (slen == 0) {
             return sv_new_from_parent_obj(self, sv, sv->offset, 0);
         }
+        sv_check_compatible_string(sv, arg1);
         if (slen > sv->length) return Qnil;
 
         long pos = rb_memsearch(RSTRING_PTR(arg1), slen, p, sv->length, sv_enc(sv));
@@ -1435,8 +1539,9 @@ static VALUE sv_delete_prefix(VALUE self, VALUE prefix) {
     const char *p = sv_ptr(sv);
     long plen = RSTRING_LEN(prefix);
 
-    if (plen > sv->length) return self;
     if (plen == 0) return self;
+    sv_check_compatible_string(sv, prefix);
+    if (plen > sv->length) return self;
     if (memcmp(p, RSTRING_PTR(prefix), plen) != 0) return self;
 
     return sv_new_from_parent_obj(self, sv, sv->offset + plen, sv->length - plen);
@@ -1453,8 +1558,9 @@ static VALUE sv_delete_suffix(VALUE self, VALUE suffix) {
     const char *p = sv_ptr(sv);
     long slen = RSTRING_LEN(suffix);
 
-    if (slen > sv->length) return self;
     if (slen == 0) return self;
+    sv_check_compatible_string(sv, suffix);
+    if (slen > sv->length) return self;
     if (memcmp(p + sv->length - slen, RSTRING_PTR(suffix), slen) != 0) return self;
 
     return sv_new_from_parent_obj(self, sv, sv->offset, sv->length - slen);
@@ -1505,16 +1611,7 @@ static VALUE sv_ord(VALUE self) {
  */
 static VALUE sv_valid_encoding_p(VALUE self) {
     string_view_t *sv = sv_get_struct(self);
-    rb_encoding *enc = sv_enc(sv);
-    const char *p = sv_ptr(sv);
-    const char *e = p + sv->length;
-
-    while (p < e) {
-        int len = rb_enc_precise_mbclen(p, e, enc);
-        if (!MBCLEN_CHARFOUND_P(len)) return Qfalse;
-        p += MBCLEN_CHARFOUND_LEN(len);
-    }
-    return Qtrue;
+    return sv_valid_encoding_cached(sv) ? Qtrue : Qfalse;
 }
 
 /*
