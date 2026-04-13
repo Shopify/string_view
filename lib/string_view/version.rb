@@ -4,5 +4,5 @@
 # without requiring the C extension.
 # The C extension defines StringView as a class, so we use `class` here.
 class StringView
-  VERSION = "0.2.0"
+  VERSION = "0.2.1"
 end
