@@ -1189,7 +1189,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
             long total = sv->length;
             if (idx < 0) idx += total;
             if (SV_UNLIKELY(idx < 0 || idx > total || len < 0)) return Qnil;
-            if (idx + len > total) len = total - idx;
+            if (len > total - idx) len = total - idx;
             return sv_new_from_parent_obj(self, sv,
                                        sv->offset + idx,
                                        len);
@@ -1211,7 +1211,7 @@ static VALUE sv_aref(int argc, VALUE *argv, VALUE self) {
 
         /* Clamp len to remaining characters */
         long total_chars = sv_char_count(sv);
-        if (idx + len > total_chars) len = total_chars - idx;
+        if (len > total_chars - idx) len = total_chars - idx;
 
         long byte_end = sv_char_to_byte_offset(sv, idx + len);
         long byte_len = byte_end - byte_off;
@@ -1310,7 +1310,7 @@ static VALUE sv_byteslice(int argc, VALUE *argv, VALUE self) {
         if (off < 0) off += sv->length;
         if (off < 0 || off > sv->length) return Qnil;
         if (len < 0) return Qnil;
-        if (off + len > sv->length) len = sv->length - off;
+        if (len > sv->length - off) len = sv->length - off;
 
         return sv_new_from_parent_obj(self, sv, sv->offset + off, len);
     }
